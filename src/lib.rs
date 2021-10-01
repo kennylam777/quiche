@@ -4629,6 +4629,7 @@ impl Connection {
             stream_retrans_bytes: self.stream_retrans_bytes,
             pmtu: self.recovery.max_datagram_size(),
             delivery_rate: self.recovery.delivery_rate(),
+            dcid_len: self.dcid.len() as u8, // RFC 9000 sets limit of 20 bytes on `dcid`
             peer_max_idle_timeout: self.peer_transport_params.max_idle_timeout,
             peer_max_udp_payload_size: self
                 .peer_transport_params
@@ -5450,6 +5451,9 @@ pub struct Stats {
 
     /// The most recent data delivery rate estimate in bytes/s.
     pub delivery_rate: u64,
+
+    /// The length of the connection's `dcid` field in bytes.
+    pub dcid_len: u8,
 
     /// The maximum idle timeout.
     pub peer_max_idle_timeout: u64,

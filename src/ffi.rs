@@ -981,6 +981,7 @@ pub struct Stats {
     stream_retrans_bytes: u64,
     pmtu: usize,
     delivery_rate: u64,
+    dcid_len: u8,
     peer_max_idle_timeout: u64,
     peer_max_udp_payload_size: u64,
     peer_initial_max_data: u64,
@@ -1012,6 +1013,7 @@ pub extern fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
     out.stream_retrans_bytes = stats.stream_retrans_bytes;
     out.pmtu = stats.pmtu;
     out.delivery_rate = stats.delivery_rate;
+    out.dcid_len = stats.dcid_len;
     out.peer_max_idle_timeout = stats.peer_max_idle_timeout;
     out.peer_max_udp_payload_size = stats.peer_max_udp_payload_size;
     out.peer_initial_max_data = stats.peer_initial_max_data;

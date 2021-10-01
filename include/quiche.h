@@ -456,6 +456,9 @@ typedef struct {
     // The most recent data delivery rate estimate in bytes/s.
     uint64_t delivery_rate;
 
+    // The length of the destination connection ID in bytes.
+    uint8_t dcid_len;
+
     // The maximum idle timeout.
     uint64_t peer_max_idle_timeout;
 
