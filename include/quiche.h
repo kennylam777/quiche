@@ -34,6 +34,13 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+#if defined(WIN32) || defined(_WIN32) || defined(__WIN32__) || defined(__NT__)
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
+
 #ifdef __unix__
 #include <sys/types.h>
 #endif
@@ -201,6 +208,12 @@ void quiche_config_enable_hystart(quiche_config *config, bool v);
 void quiche_config_enable_dgram(quiche_config *config, bool enabled,
                                 size_t recv_queue_len,
                                 size_t send_queue_len);
+
+// Sets the maximum connection window.
+void quiche_config_set_max_connection_window(quiche_config *config, uint64_t v);
+
+// Sets the maximum stream window.
+void quiche_config_set_max_stream_window(quiche_config *config, uint64_t v);
 
 // Frees the config object.
 void quiche_config_free(quiche_config *config);
@@ -670,6 +683,16 @@ int quiche_h3_event_for_each_header(quiche_h3_event *ev,
                                               uint8_t *value, size_t value_len,
                                               void *argp),
                                     void *argp);
+
+// Iterates over the peer's HTTP/3 settings.
+//
+// The `cb` callback will be called for each setting in `conn`.
+// If `cb` returns any value other than `0`, processing will be interrupted and
+// the value is returned to the caller.
+int quiche_h3_for_each_setting(quiche_h3_conn *conn,
+                               int (*cb)(uint64_t identifier,
+                                         uint64_t value, void *argp),
+                               void *argp);
 
 // Check whether data will follow the headers on the stream.
 bool quiche_h3_event_headers_has_body(quiche_h3_event *ev);

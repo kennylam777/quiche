@@ -42,6 +42,9 @@ use crate::minmax;
 use crate::packet;
 use crate::ranges;
 
+#[cfg(feature = "qlog")]
+use qlog::events::EventData;
+
 // Loss Recovery
 const INITIAL_PACKET_THRESHOLD: u64 = 3;
 
@@ -65,6 +68,10 @@ const INITIAL_WINDOW_PACKETS: usize = 10;
 const MINIMUM_WINDOW_PACKETS: usize = 2;
 
 const LOSS_REDUCTION_FACTOR: f64 = 0.5;
+
+const PACING_MULTIPLIER: f64 = 1.25;
+
+const MICROS_PER_SEC: u64 = 1_000_000;
 
 pub struct Recovery {
     loss_detection_timer: Option<Instant>,
@@ -283,8 +290,10 @@ impl Recovery {
         // Pacing: Set the pacing rate if CC doesn't do its own.
         if !(self.cc_ops.has_custom_pacing)() {
             if let Some(srtt) = self.smoothed_rtt {
-                let rate = (self.congestion_window as u64 * 1000000) /
-                    srtt.as_micros() as u64;
+                let cwnd = self.congestion_window as u64;
+                let rate =
+                    (cwnd * MICROS_PER_SEC) as f64 / srtt.as_micros() as f64;
+                let rate = (rate * PACING_MULTIPLIER) as u64;
                 self.set_pacing_rate(rate);
             }
         }
@@ -328,7 +337,7 @@ impl Recovery {
         self.last_packet_scheduled_time = match self.last_packet_scheduled_time {
             Some(last_scheduled_time) => {
                 let interval: u64 =
-                    (packet_size as u64 * 1000000) / self.pacing_rate;
+                    (packet_size as u64 * MICROS_PER_SEC) / self.pacing_rate;
                 let interval = Duration::from_micros(interval);
                 let next_schedule_time = last_scheduled_time + interval;
                 Some(cmp::max(now, next_schedule_time))
@@ -914,7 +923,7 @@ impl Recovery {
     }
 
     #[cfg(feature = "qlog")]
-    pub fn maybe_qlog(&mut self) -> Option<qlog::EventData> {
+    pub fn maybe_qlog(&mut self) -> Option<EventData> {
         let qlog_metrics = QlogMetrics {
             min_rtt: self.min_rtt,
             smoothed_rtt: self.rtt(),
@@ -1149,7 +1158,7 @@ impl QlogMetrics {
     // This function diffs each of the fields. A qlog MetricsUpdated event is
     // only generated if at least one field is different. Where fields are
     // different, the qlog event contains the latest value.
-    fn maybe_update(&mut self, latest: Self) -> Option<qlog::EventData> {
+    fn maybe_update(&mut self, latest: Self) -> Option<EventData> {
         let mut emit_event = false;
 
         let new_min_rtt = if self.min_rtt != latest.min_rtt {
@@ -1211,18 +1220,20 @@ impl QlogMetrics {
 
         if emit_event {
             // QVis can't use all these fields and they can be large.
-            return Some(qlog::EventData::MetricsUpdated {
-                min_rtt: new_min_rtt,
-                smoothed_rtt: new_smoothed_rtt,
-                latest_rtt: new_latest_rtt,
-                rtt_variance: new_rttvar,
-                pto_count: None,
-                congestion_window: new_cwnd,
-                bytes_in_flight: new_bytes_in_flight,
-                ssthresh: new_ssthresh,
-                packets_in_flight: None,
-                pacing_rate: None,
-            });
+            return Some(EventData::MetricsUpdated(
+                qlog::events::quic::MetricsUpdated {
+                    min_rtt: new_min_rtt,
+                    smoothed_rtt: new_smoothed_rtt,
+                    latest_rtt: new_latest_rtt,
+                    rtt_variance: new_rttvar,
+                    pto_count: None,
+                    congestion_window: new_cwnd,
+                    bytes_in_flight: new_bytes_in_flight,
+                    ssthresh: new_ssthresh,
+                    packets_in_flight: None,
+                    pacing_rate: None,
+                },
+            ));
         }
 
         None
@@ -1951,11 +1962,11 @@ mod tests {
 
         // We pace this outgoing packet. as all conditions for pacing
         // are passed.
-        assert_eq!(r.pacing_rate, (12000.0 / 0.05) as u64);
+        assert_eq!(r.pacing_rate, (12000.0 * PACING_MULTIPLIER / 0.05) as u64);
         assert_eq!(
             r.get_packet_send_time().unwrap(),
             now + Duration::from_micros(
-                (6500 * 1000000) / (12000.0 / 0.05) as u64
+                (6500 * 1000000) / (12000.0 * PACING_MULTIPLIER / 0.05) as u64
             )
         );
     }

@@ -112,19 +112,20 @@ impl Type {
     }
 
     #[cfg(feature = "qlog")]
-    pub(crate) fn to_qlog(self) -> qlog::PacketType {
+    pub(crate) fn to_qlog(self) -> qlog::events::quic::PacketType {
         match self {
-            Type::Initial => qlog::PacketType::Initial,
+            Type::Initial => qlog::events::quic::PacketType::Initial,
 
-            Type::Retry => qlog::PacketType::Retry,
+            Type::Retry => qlog::events::quic::PacketType::Retry,
 
-            Type::Handshake => qlog::PacketType::Handshake,
+            Type::Handshake => qlog::events::quic::PacketType::Handshake,
 
-            Type::ZeroRTT => qlog::PacketType::ZeroRtt,
+            Type::ZeroRTT => qlog::events::quic::PacketType::ZeroRtt,
 
-            Type::VersionNegotiation => qlog::PacketType::VersionNegotiation,
+            Type::VersionNegotiation =>
+                qlog::events::quic::PacketType::VersionNegotiation,
 
-            Type::Short => qlog::PacketType::OneRtt,
+            Type::Short => qlog::events::quic::PacketType::OneRtt,
         }
     }
 }
@@ -862,13 +863,19 @@ impl PktNumSpace {
                 std::u64::MAX,
                 true,
                 true,
+                stream::MAX_STREAM_WINDOW,
             ),
         }
     }
 
     pub fn clear(&mut self) {
-        self.crypto_stream =
-            stream::Stream::new(std::u64::MAX, std::u64::MAX, true, true);
+        self.crypto_stream = stream::Stream::new(
+            std::u64::MAX,
+            std::u64::MAX,
+            true,
+            true,
+            stream::MAX_STREAM_WINDOW,
+        );
 
         self.ack_elicited = false;
     }

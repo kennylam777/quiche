@@ -61,9 +61,12 @@ const BETA_CUBIC: f64 = 0.7;
 
 const C: f64 = 0.4;
 
-/// The packet count threshold to restore to the prior state if the
-/// lost packet count since the last checkpoint is less than the threshold.
-const RESTORE_COUNT_THRESHOLD: usize = 10;
+/// Threshold for rolling back state, as percentage of lost packets relative to
+/// cwnd.
+const ROLLBACK_THRESHOLD_PERCENT: usize = 20;
+
+/// Minimum threshold for rolling back state, as number of packets.
+const MIN_ROLLBACK_THRESHOLD: usize = 2;
 
 /// Default value of alpha_aimd in the beginning of congestion avoidance.
 const ALPHA_AIMD: f64 = 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC);
@@ -90,6 +93,9 @@ pub struct State {
 
     // CUBIC state checkpoint preceding the last congestion event.
     prior: PriorState,
+
+    // Maximum bytes-in-flight size during the connection.
+    max_bytes_in_flight: usize,
 }
 
 /// Stores the CUBIC state from before the last congestion event.
@@ -181,6 +187,9 @@ fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, now: Instant) {
 
     cubic.last_sent_time = Some(now);
 
+    cubic.max_bytes_in_flight =
+        cmp::max(cubic.max_bytes_in_flight, r.bytes_in_flight + sent_bytes);
+
     reno::on_packet_sent(r, sent_bytes, now);
 }
 
@@ -188,6 +197,7 @@ fn on_packet_acked(
     r: &mut Recovery, packet: &Acked, epoch: packet::Epoch, now: Instant,
 ) {
     let in_congestion_recovery = r.in_congestion_recovery(packet.time_sent);
+    let mut enter_ca = false;
 
     r.bytes_in_flight = r.bytes_in_flight.saturating_sub(packet.size);
 
@@ -210,12 +220,16 @@ fn on_packet_acked(
     // <https://tools.ietf.org/id/draft-ietf-tcpm-rfc8312bis-00.html#section-4.9>
     //
     // When the recovery episode ends with recovering
-    // a few packets (less than RESTORE_COUNT_THRESHOLD), it's considered
-    // as spurious and restore to the previous state.
+    // a few packets (less than cwnd / mss * ROLLBACK_THRESHOLD_PERCENT(%)), it's
+    // considered as spurious and restore to the previous state.
     if r.congestion_recovery_start_time.is_some() {
         let new_lost = r.lost_count - r.cubic_state.prior.lost_count;
+        let rollback_threshold = (r.congestion_window / r.max_datagram_size) *
+            ROLLBACK_THRESHOLD_PERCENT /
+            100;
+        let rollback_threshold = rollback_threshold.max(MIN_ROLLBACK_THRESHOLD);
 
-        if new_lost < RESTORE_COUNT_THRESHOLD {
+        if new_lost < rollback_threshold {
             let did_rollback = rollback(r);
 
             if did_rollback {
@@ -249,7 +263,8 @@ fn on_packet_acked(
             r.max_datagram_size,
         ) {
             // Exit to congestion avoidance if CSS ends.
-            r.ssthresh = r.congestion_window;
+            // Update ssthresh later when cwnd is finally decided.
+            enter_ca = true;
         }
     } else {
         // Congestion avoidance.
@@ -327,6 +342,17 @@ fn on_packet_acked(
             r.cubic_state.cwnd_inc -= r.max_datagram_size;
         }
     }
+
+    // Limit the cwnd growth to 2 x max_bytes_in_flight, to
+    // prevent cwnd from growing without loss feedback from
+    // the network.
+    r.congestion_window =
+        cmp::min(r.congestion_window, 2 * r.cubic_state.max_bytes_in_flight);
+
+    // Enter into congestion avoidance if needed.
+    if enter_ca {
+        r.ssthresh = r.congestion_window;
+    }
 }
 
 fn congestion_event(
@@ -385,6 +411,11 @@ fn checkpoint(r: &mut Recovery) {
 }
 
 fn rollback(r: &mut Recovery) -> bool {
+    // Don't go back to slow start.
+    if r.cubic_state.prior.congestion_window < r.cubic_state.prior.ssthresh {
+        return false;
+    }
+
     if r.congestion_window >= r.cubic_state.prior.congestion_window {
         return false;
     }
@@ -574,7 +605,7 @@ mod tests {
         now += rtt;
 
         // To avoid rollback
-        r.lost_count += RESTORE_COUNT_THRESHOLD;
+        r.lost_count += MIN_ROLLBACK_THRESHOLD;
 
         // During Congestion Avoidance, it will take
         // 5 ACKs to increase cwnd by 1 MSS.
@@ -722,13 +753,12 @@ mod tests {
 
         // Now we are in CSS.
         assert_eq!(r.hystart.css_start_time().is_some(), true);
-        assert_eq!(r.cwnd(), cwnd_prev + r.max_datagram_size);
+        assert_eq!(r.cwnd(), cwnd_prev);
 
         // 3rd round, which RTT is less than previous round to
         // trigger back to Slow Start.
         let rtt_3rd = Duration::from_millis(80);
         let now = now + rtt_3rd;
-        cwnd_prev = r.cwnd();
 
         // Send 3nd round packets.
         for _ in 0..n_rtt_sample {
@@ -754,12 +784,7 @@ mod tests {
 
         // Now we are back in Slow Start.
         assert_eq!(r.hystart.css_start_time().is_some(), false);
-        assert_eq!(
-            r.cwnd(),
-            cwnd_prev +
-                r.max_datagram_size / hystart::CSS_GROWTH_DIVISOR *
-                    hystart::N_RTT_SAMPLE
-        );
+        assert!(r.cwnd() < r.ssthresh);
     }
 
     #[test]
@@ -855,7 +880,9 @@ mod tests {
 
         // Now we are in CSS.
         assert_eq!(r.hystart.css_start_time().is_some(), true);
-        assert_eq!(r.cwnd(), cwnd_prev + r.max_datagram_size);
+
+        // cwnd doesn't increase during 2nd round.
+        assert_eq!(r.cwnd(), cwnd_prev);
 
         // Run 5 (CSS_ROUNDS) in CSS, to exit to congestion avoidance.
         let rtt_css = Duration::from_millis(100);
@@ -928,7 +955,39 @@ mod tests {
             now + rtt + Duration::from_millis(5),
         );
 
-        // cwnd is restored to the previous one.
+        // This is from slow start, no rollback.
+        assert_eq!(r.cwnd(), cur_cwnd);
+
+        let now = now + rtt;
+
+        // Trigger another congestion event.
+        let prev_cwnd = r.cwnd();
+        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+
+        // After congestion event, cwnd will be reduced.
+        let cur_cwnd = (cur_cwnd as f64 * BETA_CUBIC) as usize;
+        assert_eq!(r.cwnd(), cur_cwnd);
+
+        let rtt = Duration::from_millis(100);
+
+        let acked = vec![Acked {
+            pkt_num: 0,
+            // To exit from recovery
+            time_sent: now + rtt,
+            size: r.max_datagram_size,
+        }];
+
+        // Ack more than cwnd bytes with rtt=100ms.
+        r.update_rtt(rtt, Duration::from_millis(0), now);
+
+        // Trigger detecting sprurious congestion event.
+        r.on_packets_acked(
+            acked,
+            packet::EPOCH_APPLICATION,
+            now + rtt + Duration::from_millis(5),
+        );
+
+        // cwnd is rolled back to the previous one.
         assert_eq!(r.cwnd(), prev_cwnd);
     }
 
@@ -961,7 +1020,7 @@ mod tests {
         now += rtt;
 
         // To avoid rollback
-        r.lost_count += RESTORE_COUNT_THRESHOLD;
+        r.lost_count += MIN_ROLLBACK_THRESHOLD;
 
         // During Congestion Avoidance, it will take
         // 5 ACKs to increase cwnd by 1 MSS.

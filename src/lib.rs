@@ -295,6 +295,25 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(feature = "qlog")]
+use qlog::events::connectivity::TransportOwner;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::RecoveryEventType;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::TransportEventType;
+#[cfg(feature = "qlog")]
+use qlog::events::DataRecipient;
+#[cfg(feature = "qlog")]
+use qlog::events::Event;
+#[cfg(feature = "qlog")]
+use qlog::events::EventData;
+#[cfg(feature = "qlog")]
+use qlog::events::EventImportance;
+#[cfg(feature = "qlog")]
+use qlog::events::EventType;
+#[cfg(feature = "qlog")]
+use qlog::events::RawInfo;
+
 use std::cmp;
 use std::time;
 
@@ -351,11 +370,6 @@ const DEFAULT_MAX_DGRAM_QUEUE_LEN: usize = 0;
 // frames size. We enforce the recommendation for forward compatibility.
 const MAX_DGRAM_FRAME_SIZE: u64 = 65536;
 
-// The minimum payload size that should be emitted when using AEAD scatter
-// seal. For smaller amounts of data, scattering doesn't provide much benefit
-// and would prevent smaller buffers from being merged together.
-const MIN_SCATTER_BUFFER_SIZE: usize = 512;
-
 // The length of the payload length field.
 const PAYLOAD_LENGTH_LEN: usize = 2;
 
@@ -363,6 +377,16 @@ const PAYLOAD_LENGTH_LEN: usize = 2;
 const MAX_UNDECRYPTABLE_PACKETS: usize = 10;
 
 const RESERVED_VERSION_MASK: u32 = 0xfafafafa;
+
+// The default size of the receiver connection flow control window.
+const DEFAULT_CONNECTION_WINDOW: u64 = 48 * 1024;
+
+// The maximum size of the receiver connection flow control window.
+const MAX_CONNECTION_WINDOW: u64 = 24 * 1024 * 1024;
+
+// How much larger the connection flow control window need to be larger than
+// the stream flow control window.
+const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 /// A specialized [`Result`] type for quiche operations.
 ///
@@ -568,6 +592,9 @@ pub struct Config {
     dgram_send_max_queue_len: usize,
 
     max_send_udp_payload_size: usize,
+
+    max_connection_window: u64,
+    max_stream_window: u64,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -604,6 +631,9 @@ impl Config {
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
 
             max_send_udp_payload_size: MAX_SEND_UDP_PAYLOAD_SIZE,
+
+            max_connection_window: MAX_CONNECTION_WINDOW,
+            max_stream_window: stream::MAX_STREAM_WINDOW,
         })
     }
 
@@ -929,6 +959,20 @@ impl Config {
         self.dgram_recv_max_queue_len = recv_queue_len;
         self.dgram_send_max_queue_len = send_queue_len;
     }
+
+    /// Sets the maximum size of the connection window.
+    ///
+    /// The default value is MAX_CONNECTION_WINDOW (24MBytes).
+    pub fn set_max_connection_window(&mut self, v: u64) {
+        self.max_connection_window = v;
+    }
+
+    /// Sets the maximum size of the stream window.
+    ///
+    /// The default value is MAX_STREAM_WINDOW (16MBytes).
+    pub fn set_max_stream_window(&mut self, v: u64) {
+        self.max_stream_window = v;
+    }
 }
 
 /// A QUIC connection.
@@ -983,12 +1027,8 @@ pub struct Connection {
     /// Total number of bytes received from the peer.
     rx_data: u64,
 
-    /// Local flow control limit for the connection.
-    max_rx_data: u64,
-
-    /// Updated local flow control limit for the connection. This is used to
-    /// trigger sending MAX_DATA frames after a certain threshold.
-    max_rx_data_next: u64,
+    /// Receiver flow controller.
+    flow_control: flowcontrol::FlowControl,
 
     /// Whether we send MAX_DATA frame.
     almost_full: bool,
@@ -1329,7 +1369,7 @@ macro_rules! qlog_with_type {
     ($ty:expr, $qlog:expr, $qlog_streamer_ref:ident, $body:block) => {{
         #[cfg(feature = "qlog")]
         {
-            if qlog::EventImportance::from($ty).is_contained_in(&$qlog.level) {
+            if EventImportance::from($ty).is_contained_in(&$qlog.level) {
                 if let Some($qlog_streamer_ref) = &mut $qlog.streamer {
                     $body
                 }
@@ -1339,30 +1379,30 @@ macro_rules! qlog_with_type {
 }
 
 #[cfg(feature = "qlog")]
-const QLOG_PARAMS_SET: qlog::EventType =
-    qlog::EventType::TransportEventType(qlog::TransportEventType::ParametersSet);
+const QLOG_PARAMS_SET: EventType =
+    EventType::TransportEventType(TransportEventType::ParametersSet);
 
 #[cfg(feature = "qlog")]
-const QLOG_PACKET_RX: qlog::EventType =
-    qlog::EventType::TransportEventType(qlog::TransportEventType::PacketReceived);
+const QLOG_PACKET_RX: EventType =
+    EventType::TransportEventType(TransportEventType::PacketReceived);
 
 #[cfg(feature = "qlog")]
-const QLOG_PACKET_TX: qlog::EventType =
-    qlog::EventType::TransportEventType(qlog::TransportEventType::PacketSent);
+const QLOG_PACKET_TX: EventType =
+    EventType::TransportEventType(TransportEventType::PacketSent);
 
 #[cfg(feature = "qlog")]
-const QLOG_DATA_MV: qlog::EventType =
-    qlog::EventType::TransportEventType(qlog::TransportEventType::DataMoved);
+const QLOG_DATA_MV: EventType =
+    EventType::TransportEventType(TransportEventType::DataMoved);
 
 #[cfg(feature = "qlog")]
-const QLOG_METRICS: qlog::EventType =
-    qlog::EventType::RecoveryEventType(qlog::RecoveryEventType::MetricsUpdated);
+const QLOG_METRICS: EventType =
+    EventType::RecoveryEventType(RecoveryEventType::MetricsUpdated);
 
 #[cfg(feature = "qlog")]
 struct QlogInfo {
-    streamer: Option<qlog::QlogStreamer>,
+    streamer: Option<qlog::streamer::QlogStreamer>,
     logged_peer_params: bool,
-    level: qlog::EventImportance,
+    level: EventImportance,
 }
 
 #[cfg(feature = "qlog")]
@@ -1371,7 +1411,7 @@ impl Default for QlogInfo {
         QlogInfo {
             streamer: None,
             logged_peer_params: false,
-            level: qlog::EventImportance::Base,
+            level: EventImportance::Base,
         }
     }
 }
@@ -1429,8 +1469,11 @@ impl Connection {
             recv_bytes: 0,
 
             rx_data: 0,
-            max_rx_data,
-            max_rx_data_next: max_rx_data,
+            flow_control: flowcontrol::FlowControl::new(
+                max_rx_data,
+                cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW),
+                config.max_connection_window,
+            ),
             almost_full: false,
 
             tx_cap: 0,
@@ -1445,6 +1488,7 @@ impl Connection {
             streams: stream::StreamMap::new(
                 config.local_transport_params.initial_max_streams_bidi,
                 config.local_transport_params.initial_max_streams_uni,
+                config.max_stream_window,
             ),
 
             odcid: None,
@@ -1611,11 +1655,11 @@ impl Connection {
         };
 
         let level = match qlog_level {
-            QlogLevel::Core => qlog::EventImportance::Core,
+            QlogLevel::Core => EventImportance::Core,
 
-            QlogLevel::Base => qlog::EventImportance::Base,
+            QlogLevel::Base => EventImportance::Base,
 
-            QlogLevel::Extra => qlog::EventImportance::Extra,
+            QlogLevel::Extra => EventImportance::Extra,
         };
 
         self.qlog.level = level;
@@ -1635,7 +1679,7 @@ impl Connection {
             None,
         );
 
-        let mut streamer = qlog::QlogStreamer::new(
+        let mut streamer = qlog::streamer::QlogStreamer::new(
             qlog::QLOG_VERSION.to_string(),
             Some(title),
             Some(description),
@@ -1650,12 +1694,10 @@ impl Connection {
 
         let ev_data = self
             .local_transport_params
-            .to_qlog(qlog::TransportOwner::Local, self.handshake.cipher());
+            .to_qlog(TransportOwner::Local, self.handshake.cipher());
 
         // This event occurs very early, so just mark the relative time as 0.0.
-        streamer
-            .add_event(qlog::Event::with_time(0.0, ev_data))
-            .ok();
+        streamer.add_event(Event::with_time(0.0, ev_data)).ok();
 
         self.qlog.streamer = Some(streamer);
     }
@@ -2102,7 +2144,7 @@ impl Connection {
         qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
             let packet_size = b.len();
 
-            let qlog_pkt_hdr = qlog::PacketHeader::with_type(
+            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
                 hdr.ty.to_qlog(),
                 pn,
                 Some(hdr.version),
@@ -2110,22 +2152,23 @@ impl Connection {
                 Some(&hdr.dcid),
             );
 
-            let qlog_raw_info = qlog::RawInfo {
+            let qlog_raw_info = RawInfo {
                 length: Some(packet_size as u64),
                 payload_length: Some(payload_len as u64),
                 data: None,
             };
 
-            let ev_data = qlog::EventData::PacketReceived {
-                header: qlog_pkt_hdr,
-                frames: Some(vec![]),
-                is_coalesced: None,
-                retry_token: None,
-                stateless_reset_token: None,
-                supported_versions: None,
-                raw: Some(qlog_raw_info),
-                datagram_id: None,
-            };
+            let ev_data =
+                EventData::PacketReceived(qlog::events::quic::PacketReceived {
+                    header: qlog_pkt_hdr,
+                    frames: Some(vec![]),
+                    is_coalesced: None,
+                    retry_token: None,
+                    stateless_reset_token: None,
+                    supported_versions: None,
+                    raw: Some(qlog_raw_info),
+                    datagram_id: None,
+                });
 
             q.add_event_data_with_instant(ev_data, now).ok();
         });
@@ -2224,10 +2267,9 @@ impl Connection {
         if self.is_established() {
             qlog_with_type!(QLOG_PARAMS_SET, self.qlog, q, {
                 if !self.qlog.logged_peer_params {
-                    let ev_data = self.peer_transport_params.to_qlog(
-                        qlog::TransportOwner::Remote,
-                        self.handshake.cipher(),
-                    );
+                    let ev_data = self
+                        .peer_transport_params
+                        .to_qlog(TransportOwner::Remote, self.handshake.cipher());
 
                     q.add_event_data_with_instant(ev_data, now).ok();
 
@@ -2734,6 +2776,7 @@ impl Connection {
             let frame = frame::Frame::ACK {
                 ack_delay,
                 ranges: self.pkt_num_spaces[epoch].recv_pkt_need_ack.clone(),
+                ecn_counts: None, // sending ECN is not supported at this time
             };
 
             if push_frame_to_pkt!(b, frames, frame, left) {
@@ -2807,18 +2850,29 @@ impl Connection {
                     },
                 };
 
+                // Autotune the stream window size.
+                stream.recv.autotune_window(now, self.recovery.rtt());
+
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
                     max: stream.recv.max_data_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    stream.recv.update_max_data();
+                    let recv_win = stream.recv.window();
+
+                    stream.recv.update_max_data(now);
 
                     self.streams.mark_almost_full(stream_id, false);
 
                     ack_eliciting = true;
                     in_flight = true;
+
+                    // Make sure the connection window always has some
+                    // room compared to the stream window.
+                    self.flow_control.ensure_window_lower_bound(
+                        (recv_win as f64 * CONNECTION_WINDOW_FACTOR) as u64,
+                    );
 
                     // Also send MAX_DATA when MAX_STREAM_DATA is sent, to avoid a
                     // potential race condition.
@@ -2827,16 +2881,19 @@ impl Connection {
             }
 
             // Create MAX_DATA frame as needed.
-            if self.almost_full && self.max_rx_data < self.max_rx_data_next {
+            if self.almost_full && self.max_rx_data() < self.max_rx_data_next() {
+                // Autotune the connection window size.
+                self.flow_control.autotune_window(now, self.recovery.rtt());
+
                 let frame = frame::Frame::MaxData {
-                    max: self.max_rx_data_next,
+                    max: self.max_rx_data_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.almost_full = false;
 
                     // Commits the new max_rx_data limit.
-                    self.max_rx_data = self.max_rx_data_next;
+                    self.flow_control.update_max_data(now);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -3017,9 +3074,6 @@ impl Connection {
             }
         }
 
-        let mut payload_extra = None;
-        let mut payload_extra_len = 0;
-
         // The preference of data-bearing frame to include in a packet
         // is managed by `self.emit_dgram`. However, whether any frames
         // can be sent depends on the state of their buffers. In the case
@@ -3071,17 +3125,8 @@ impl Connection {
                                 let (mut dgram_hdr, mut dgram_payload) =
                                     b.split_at(hdr_off + hdr_len)?;
 
-                                if data.len() > MIN_SCATTER_BUFFER_SIZE {
-                                    let buf = stream::RangeBuf::from_vec(
-                                        data, 0, false,
-                                    );
-
-                                    payload_extra_len = buf.len();
-                                    payload_extra = Some(buf);
-                                } else {
-                                    dgram_payload.as_mut()[..len]
-                                        .copy_from_slice(&data);
-                                }
+                                dgram_payload.as_mut()[..len]
+                                    .copy_from_slice(&data);
 
                                 // Encode the frame's header.
                                 //
@@ -3098,11 +3143,7 @@ impl Connection {
                                 )?;
 
                                 // Advance the packet buffer's offset.
-                                b.skip(hdr_len)?;
-
-                                if payload_extra.is_none() {
-                                    b.skip(len)?;
-                                }
+                                b.skip(hdr_len + len)?;
 
                                 let frame =
                                     frame::Frame::DatagramHeader { length: len };
@@ -3111,12 +3152,6 @@ impl Connection {
                                     ack_eliciting = true;
                                     in_flight = true;
                                     dgram_emitted = true;
-                                }
-
-                                // The scattered frame must be the last in the
-                                // packet, so avoid pushing more DATAGRAMs.
-                                if payload_extra.is_some() {
-                                    break;
                                 }
                             },
 
@@ -3180,47 +3215,12 @@ impl Connection {
                     None => continue,
                 };
 
-                // Calculate the minimum viable buffer length for AEAD scatter
-                // operation.
-                //
-                // Note that due to the fact that scattering requires the extra
-                // payload to be at the end of the plaintext, no frame can be
-                // encoded afterwards (including PADDING).
-                let min_len = if has_initial {
-                    // When coalescing with Initial packets, make sure we won't
-                    // need to add PADDING frames at the end, by requiring the
-                    // STREAM frame to fill the packet buffer completely.
-                    max_len
-                } else {
-                    MIN_SCATTER_BUFFER_SIZE
-                };
-
                 let (mut stream_hdr, mut stream_payload) =
                     b.split_at(hdr_off + hdr_len)?;
 
-                // Try to get a buffer with the required min and max sizes that
-                // can later be used with the AEAD scatter seal API. This avoids
-                // having to copy the plaintext data into the output buffer
-                // before encryption.
-                //
-                // But if that is not available (e.g. the front send buffer is
-                // too small), fallback to writing the stream data directly into
-                // the output buffer.
-                let (len, fin) = match stream.send.emit_owned(min_len, max_len) {
-                    Some((buf, fin)) => {
-                        payload_extra_len = buf.len();
-                        payload_extra = Some(buf);
-
-                        (payload_extra_len, fin)
-                    },
-
-                    None => {
-                        // Write stream data directly into the packet buffer.
-                        stream
-                            .send
-                            .emit(&mut stream_payload.as_mut()[..max_len])?
-                    },
-                };
+                // Write stream data into the packet buffer.
+                let (len, fin) =
+                    stream.send.emit(&mut stream_payload.as_mut()[..max_len])?;
 
                 // Encode the frame's header.
                 //
@@ -3239,11 +3239,7 @@ impl Connection {
                 )?;
 
                 // Advance the packet buffer's offset.
-                b.skip(hdr_len)?;
-
-                if payload_extra.is_none() {
-                    b.skip(len)?;
-                }
+                b.skip(hdr_len + len)?;
 
                 let frame = frame::Frame::StreamHeader {
                     stream_id,
@@ -3268,9 +3264,7 @@ impl Connection {
 
                 // When fuzzing, try to coalesce multiple STREAM frames in the
                 // same packet, so it's easier to generate fuzz corpora.
-                if cfg!(feature = "fuzzing") &&
-                    left > frame::MAX_STREAM_OVERHEAD &&
-                    payload_extra.is_none()
+                if cfg!(feature = "fuzzing") && left > frame::MAX_STREAM_OVERHEAD
                 {
                     continue;
                 }
@@ -3322,13 +3316,8 @@ impl Connection {
         }
 
         // Pad payload so that it's always at least 4 bytes.
-        if (b.off() - payload_offset) + payload_extra_len < PAYLOAD_MIN_LEN {
+        if b.off() - payload_offset < PAYLOAD_MIN_LEN {
             let payload_len = b.off() - payload_offset;
-
-            // When the extra payload is filled (i.e. `payload_extra_len > 0`)
-            // this point shouldn't be reachable, but account for the extra
-            // length anyway for completeness.
-            let payload_len = payload_len + payload_extra_len;
 
             let frame = frame::Frame::Padding {
                 len: PAYLOAD_MIN_LEN - payload_len,
@@ -3344,7 +3333,7 @@ impl Connection {
 
         // Fill in payload length.
         if pkt_type != packet::Type::Short {
-            let len = pn_len + payload_len + payload_extra_len + crypto_overhead;
+            let len = pn_len + payload_len + crypto_overhead;
 
             let (_, mut payload_with_len) = b.split_at(header_offset)?;
             payload_with_len
@@ -3355,28 +3344,31 @@ impl Connection {
             "{} tx pkt {:?} len={} pn={}",
             self.trace_id,
             hdr,
-            payload_len + payload_extra_len,
+            payload_len,
             pn
         );
 
         qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
-            let qlog_pkt_hdr = qlog::PacketHeader::with_type(
+            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
                 hdr.ty.to_qlog(),
                 pn,
                 Some(hdr.version),
                 Some(&hdr.scid),
                 Some(&hdr.dcid),
             );
-            let length =
-                Some((payload_len + payload_extra_len + payload_offset) as u64);
-            let payload_length = Some(payload_len as u64);
-            let qlog_raw_info = qlog::RawInfo {
-                length,
-                payload_length,
+
+            // Qlog packet raw info described at
+            // https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema-00#section-5.1
+            //
+            // `length` includes packet headers and trailers (AEAD tag).
+            let length = payload_len + payload_offset + crypto_overhead;
+            let qlog_raw_info = RawInfo {
+                length: Some(length as u64),
+                payload_length: Some(payload_len as u64),
                 data: None,
             };
 
-            let ev_data = qlog::EventData::PacketSent {
+            let ev_data = EventData::PacketSent(qlog::events::quic::PacketSent {
                 header: qlog_pkt_hdr,
                 frames: Some(vec![]),
                 is_coalesced: None,
@@ -3385,7 +3377,7 @@ impl Connection {
                 supported_versions: None,
                 raw: Some(qlog_raw_info),
                 datagram_id: None,
-            };
+            });
 
             q.add_event_data_with_instant(ev_data, now).ok();
         });
@@ -3413,7 +3405,7 @@ impl Connection {
             pn_len,
             payload_len,
             payload_offset,
-            payload_extra.as_deref(),
+            None,
             aead,
         )?;
 
@@ -3544,7 +3536,7 @@ impl Connection {
             },
         };
 
-        self.max_rx_data_next = self.max_rx_data_next.saturating_add(read as u64);
+        self.flow_control.add_consumed(read as u64);
 
         let readable = stream.is_readable();
 
@@ -3563,14 +3555,14 @@ impl Connection {
         }
 
         qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
-            let ev_data = qlog::EventData::DataMoved {
+            let ev_data = EventData::DataMoved(qlog::events::quic::DataMoved {
                 stream_id: Some(stream_id),
                 offset: Some(offset),
                 length: Some(read as u64),
-                from: Some(qlog::DataRecipient::Transport),
-                to: Some(qlog::DataRecipient::Application),
+                from: Some(DataRecipient::Transport),
+                to: Some(DataRecipient::Application),
                 data: None,
-            };
+            });
 
             let now = time::Instant::now();
             q.add_event_data_with_instant(ev_data, now).ok();
@@ -3714,14 +3706,14 @@ impl Connection {
         self.recovery.rate_check_app_limited();
 
         qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
-            let ev_data = qlog::EventData::DataMoved {
+            let ev_data = EventData::DataMoved(qlog::events::quic::DataMoved {
                 stream_id: Some(stream_id),
                 offset: Some(offset),
                 length: Some(sent as u64),
-                from: Some(qlog::DataRecipient::Application),
-                to: Some(qlog::DataRecipient::Transport),
+                from: Some(DataRecipient::Application),
+                to: Some(DataRecipient::Transport),
                 data: None,
-            };
+            });
 
             let now = time::Instant::now();
             q.add_event_data_with_instant(ev_data, now).ok();
@@ -4425,8 +4417,6 @@ impl Connection {
                         q.add_event_data_with_instant(ev_data, now).ok();
                     }
                 });
-
-                return;
             }
         }
     }
@@ -4931,7 +4921,9 @@ impl Connection {
 
             frame::Frame::Ping => (),
 
-            frame::Frame::ACK { ranges, ack_delay } => {
+            frame::Frame::ACK {
+                ranges, ack_delay, ..
+            } => {
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
                         self.peer_transport_params.ack_delay_exponent as u32,
@@ -4977,7 +4969,7 @@ impl Connection {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
-                let max_rx_data_left = self.max_rx_data - self.rx_data;
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
@@ -5100,7 +5092,7 @@ impl Connection {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
-                let max_rx_data_left = self.max_rx_data - self.rx_data;
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
@@ -5312,8 +5304,17 @@ impl Connection {
     /// This happens when the new max data limit is at least double the amount
     /// of data that can be received before blocking.
     fn should_update_max_data(&self) -> bool {
-        self.max_rx_data_next != self.max_rx_data &&
-            self.max_rx_data_next / 2 > self.max_rx_data - self.rx_data
+        self.flow_control.should_update_max_data()
+    }
+
+    /// Returns the connection level flow control limit.
+    fn max_rx_data(&self) -> u64 {
+        self.flow_control.max_data()
+    }
+
+    /// Returns the updated connection level flow control limit.
+    fn max_rx_data_next(&self) -> u64 {
+        self.flow_control.max_data_next()
     }
 
     /// Returns true if the HANDSHAKE_DONE frame needs to be sent.
@@ -5925,8 +5926,8 @@ impl TransportParams {
     /// Creates a qlog event for connection transport parameters and TLS fields
     #[cfg(feature = "qlog")]
     pub fn to_qlog(
-        &self, owner: qlog::TransportOwner, cipher: Option<crypto::Algorithm>,
-    ) -> qlog::EventData {
+        &self, owner: TransportOwner, cipher: Option<crypto::Algorithm>,
+    ) -> EventData {
         let original_destination_connection_id = qlog::HexSlice::maybe_string(
             self.original_destination_connection_id.as_ref(),
         );
@@ -5940,36 +5941,42 @@ impl TransportParams {
             details: None,
         });
 
-        qlog::EventData::TransportParametersSet {
-            owner: Some(owner),
-            resumption_allowed: None,
-            early_data_enabled: None,
-            tls_cipher: Some(format!("{:?}", cipher)),
-            aead_tag_length: None,
-            original_destination_connection_id,
-            initial_source_connection_id: None,
-            retry_source_connection_id: None,
-            stateless_reset_token,
-            disable_active_migration: Some(self.disable_active_migration),
-            max_idle_timeout: Some(self.max_idle_timeout),
-            max_udp_payload_size: Some(self.max_udp_payload_size as u32),
-            ack_delay_exponent: Some(self.ack_delay_exponent as u16),
-            max_ack_delay: Some(self.max_ack_delay as u16),
-            active_connection_id_limit: Some(self.active_conn_id_limit as u32),
+        EventData::TransportParametersSet(
+            qlog::events::quic::TransportParametersSet {
+                owner: Some(owner),
+                resumption_allowed: None,
+                early_data_enabled: None,
+                tls_cipher: Some(format!("{:?}", cipher)),
+                aead_tag_length: None,
+                original_destination_connection_id,
+                initial_source_connection_id: None,
+                retry_source_connection_id: None,
+                stateless_reset_token,
+                disable_active_migration: Some(self.disable_active_migration),
+                max_idle_timeout: Some(self.max_idle_timeout),
+                max_udp_payload_size: Some(self.max_udp_payload_size as u32),
+                ack_delay_exponent: Some(self.ack_delay_exponent as u16),
+                max_ack_delay: Some(self.max_ack_delay as u16),
+                active_connection_id_limit: Some(
+                    self.active_conn_id_limit as u32,
+                ),
 
-            initial_max_data: Some(self.initial_max_data),
-            initial_max_stream_data_bidi_local: Some(
-                self.initial_max_stream_data_bidi_local,
-            ),
-            initial_max_stream_data_bidi_remote: Some(
-                self.initial_max_stream_data_bidi_remote,
-            ),
-            initial_max_stream_data_uni: Some(self.initial_max_stream_data_uni),
-            initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
-            initial_max_streams_uni: Some(self.initial_max_streams_uni),
+                initial_max_data: Some(self.initial_max_data),
+                initial_max_stream_data_bidi_local: Some(
+                    self.initial_max_stream_data_bidi_local,
+                ),
+                initial_max_stream_data_bidi_remote: Some(
+                    self.initial_max_stream_data_bidi_remote,
+                ),
+                initial_max_stream_data_uni: Some(
+                    self.initial_max_stream_data_uni,
+                ),
+                initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
+                initial_max_streams_uni: Some(self.initial_max_streams_uni),
 
-            preferred_address: None,
-        }
+                preferred_address: None,
+            },
+        )
     }
 }
 
@@ -6912,52 +6919,6 @@ mod tests {
     }
 
     #[test]
-    fn mega_stream() {
-        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-        config
-            .load_cert_chain_from_pem_file("examples/cert.crt")
-            .unwrap();
-        config
-            .load_priv_key_from_pem_file("examples/cert.key")
-            .unwrap();
-        config
-            .set_application_protos(b"\x06proto1\x06proto2")
-            .unwrap();
-        config.set_initial_max_data(1000000);
-        config.set_initial_max_stream_data_bidi_local(1000000);
-        config.set_initial_max_stream_data_bidi_remote(1000000);
-        config.set_initial_max_stream_data_uni(1000000);
-        config.set_initial_max_streams_bidi(3);
-        config.set_initial_max_streams_uni(3);
-        config.set_max_idle_timeout(180_000);
-        config.verify_peer(false);
-        config.set_ack_delay_exponent(8);
-
-        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.handshake(), Ok(()));
-
-        const STREAM_DATA_LEN: usize = 12000;
-
-        let stream_data = [0xa; STREAM_DATA_LEN];
-        assert_eq!(
-            pipe.client.stream_send(4, &stream_data, true),
-            Ok(STREAM_DATA_LEN)
-        );
-        assert_eq!(pipe.advance(), Ok(()));
-
-        let mut r = pipe.server.readable();
-        assert_eq!(r.next(), Some(4));
-        assert_eq!(r.next(), None);
-
-        let mut recv_data = [0; STREAM_DATA_LEN];
-        assert_eq!(
-            pipe.server.stream_recv(4, &mut recv_data),
-            Ok((STREAM_DATA_LEN, true))
-        );
-        assert_eq!(&recv_data[..], &stream_data[..]);
-    }
-
-    #[test]
     fn zero_rtt() {
         let mut buf = [0; 65535];
 
@@ -7268,7 +7229,7 @@ mod tests {
                 max: 30
             })
         );
-        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 46 }));
+        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
     }
 
     #[test]
@@ -7352,7 +7313,7 @@ mod tests {
 
         let frames = [frame::Frame::Stream {
             stream_id: 4,
-            data: stream::RangeBuf::from(b"aaaaaaa", 0, false),
+            data: stream::RangeBuf::from(b"aaaaaaaaa", 0, false),
         }];
 
         let pkt_type = packet::Type::Short;
@@ -7363,7 +7324,7 @@ mod tests {
 
         let frames = [frame::Frame::Stream {
             stream_id: 4,
-            data: stream::RangeBuf::from(b"a", 7, false),
+            data: stream::RangeBuf::from(b"a", 9, false),
         }];
 
         let len = pipe
@@ -7383,7 +7344,7 @@ mod tests {
             iter.next(),
             Some(&frame::Frame::MaxStreamData {
                 stream_id: 4,
-                max: 22,
+                max: 24,
             })
         );
     }
@@ -8076,6 +8037,7 @@ mod tests {
         let frames = [frame::Frame::ACK {
             ack_delay: 15,
             ranges,
+            ecn_counts: None,
         }];
 
         assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(0));
@@ -11171,6 +11133,7 @@ mod crypto;
 mod dgram;
 #[cfg(feature = "ffi")]
 mod ffi;
+mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;

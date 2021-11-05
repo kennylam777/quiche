@@ -36,9 +36,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use std::time;
+
 use crate::Error;
 use crate::Result;
 
+use crate::flowcontrol;
 use crate::ranges;
 
 const DEFAULT_URGENCY: u8 = 127;
@@ -48,6 +51,12 @@ const SEND_BUFFER_SIZE: usize = 5;
 
 #[cfg(not(test))]
 const SEND_BUFFER_SIZE: usize = 4096;
+
+// The default size of the receiver stream flow control window.
+const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+
+/// The maximum size of the receiver stream flow control window.
+pub const MAX_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
@@ -132,16 +141,23 @@ pub struct StreamMap {
     /// receive side, and need to send a STOP_SENDING frame. The value of the
     /// map elements is the error code to include in the STOP_SENDING frame.
     stopped: HashMap<u64, u64>,
+
+    /// The maximum size of a stream window.
+    max_stream_window: u64,
 }
 
 impl StreamMap {
-    pub fn new(max_streams_bidi: u64, max_streams_uni: u64) -> StreamMap {
+    pub fn new(
+        max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
+    ) -> StreamMap {
         StreamMap {
             local_max_streams_bidi: max_streams_bidi,
             local_max_streams_bidi_next: max_streams_bidi,
 
             local_max_streams_uni: max_streams_uni,
             local_max_streams_uni_next: max_streams_uni,
+
+            max_stream_window,
 
             ..StreamMap::default()
         }
@@ -248,7 +264,13 @@ impl StreamMap {
                     },
                 };
 
-                let s = Stream::new(max_rx_data, max_tx_data, is_bidi(id), local);
+                let s = Stream::new(
+                    max_rx_data,
+                    max_tx_data,
+                    is_bidi(id),
+                    local,
+                    self.max_stream_window,
+                );
                 v.insert(s)
             },
 
@@ -578,9 +600,10 @@ impl Stream {
     /// Creates a new stream with the given flow control limits.
     pub fn new(
         max_rx_data: u64, max_tx_data: u64, bidi: bool, local: bool,
+        max_window: u64,
     ) -> Stream {
         Stream {
-            recv: RecvBuf::new(max_rx_data),
+            recv: RecvBuf::new(max_rx_data, max_window),
             send: SendBuf::new(max_tx_data),
             bidi,
             local,
@@ -693,11 +716,8 @@ pub struct RecvBuf {
     /// The total length of data received on this stream.
     len: u64,
 
-    /// The maximum offset the peer is allowed to send us.
-    max_data: u64,
-
-    /// The updated maximum offset the peer is allowed to send us.
-    max_data_next: u64,
+    /// Receiver flow controller.
+    flow_control: flowcontrol::FlowControl,
 
     /// The final stream offset received from the peer, if any.
     fin_off: Option<u64>,
@@ -711,10 +731,13 @@ pub struct RecvBuf {
 
 impl RecvBuf {
     /// Creates a new receive buffer.
-    fn new(max_data: u64) -> RecvBuf {
+    fn new(max_data: u64, max_window: u64) -> RecvBuf {
         RecvBuf {
-            max_data,
-            max_data_next: max_data,
+            flow_control: flowcontrol::FlowControl::new(
+                max_data,
+                cmp::min(max_data, DEFAULT_STREAM_WINDOW),
+                max_window,
+            ),
             ..RecvBuf::default()
         }
     }
@@ -725,7 +748,7 @@ impl RecvBuf {
     /// as handling incoming data that overlaps data that is already in the
     /// buffer.
     pub fn write(&mut self, buf: RangeBuf) -> Result<()> {
-        if buf.max_off() > self.max_data {
+        if buf.max_off() > self.max_data() {
             return Err(Error::FlowControl);
         }
 
@@ -878,7 +901,8 @@ impl RecvBuf {
             std::collections::binary_heap::PeekMut::pop(buf);
         }
 
-        self.max_data_next = self.max_data_next.saturating_add(len as u64);
+        // Update consumed bytes for flow control.
+        self.flow_control.add_consumed(len as u64);
 
         Ok((len, self.is_fin()))
     }
@@ -921,13 +945,28 @@ impl RecvBuf {
     }
 
     /// Commits the new max_data limit.
-    pub fn update_max_data(&mut self) {
-        self.max_data = self.max_data_next;
+    pub fn update_max_data(&mut self, now: time::Instant) {
+        self.flow_control.update_max_data(now);
     }
 
     /// Return the new max_data limit.
     pub fn max_data_next(&mut self) -> u64 {
-        self.max_data_next
+        self.flow_control.max_data_next()
+    }
+
+    /// Return the current flow control limit.
+    fn max_data(&self) -> u64 {
+        self.flow_control.max_data()
+    }
+
+    /// Return the current window.
+    pub fn window(&self) -> u64 {
+        self.flow_control.window()
+    }
+
+    /// Autotune the window size.
+    pub fn autotune_window(&mut self, now: time::Instant, rtt: time::Duration) {
+        self.flow_control.autotune_window(now, rtt);
     }
 
     /// Shuts down receiving data.
@@ -952,11 +991,7 @@ impl RecvBuf {
 
     /// Returns true if we need to update the local flow control limit.
     pub fn almost_full(&self) -> bool {
-        // Send MAX_STREAM_DATA when the new limit is at least double the
-        // amount of data that can be received before blocking.
-        self.fin_off.is_none() &&
-            self.max_data_next != self.max_data &&
-            self.max_data_next / 2 > self.max_data - self.len
+        self.fin_off.is_none() && self.flow_control.should_update_max_data()
     }
 
     /// Returns the largest offset ever received.
@@ -1161,50 +1196,6 @@ impl SendBuf {
         let fin = self.fin_off == Some(next_off);
 
         Ok((out.len() - out_len, fin))
-    }
-
-    /// Returns the first contiguous chunk of data from the send buffer.
-    ///
-    /// The returned buffer will be between `min_len` and `max_len` bytes. If no
-    /// buffer is available, or if an available buffer is smaller, `None` is
-    /// returned.
-    pub fn emit_owned(
-        &mut self, min_len: usize, max_len: usize,
-    ) -> Option<(RangeBuf, bool)> {
-        if !self.ready() {
-            return None;
-        }
-
-        let buf = self.data.get_mut(self.pos)?;
-
-        if buf.len() < min_len {
-            return None;
-        }
-
-        let buf_len = cmp::min(buf.len(), max_len);
-        let partial = buf_len < buf.len();
-
-        let out_buf = buf.clone_count(buf_len);
-
-        let next_off = out_buf.off() + buf_len as u64;
-
-        self.len -= buf_len as u64;
-
-        buf.consume(buf_len);
-
-        if !partial {
-            self.pos += 1;
-        }
-
-        // Override the `fin` flag set for the output buffer by matching the
-        // buffer's maximum offset against the stream's final offset (if known).
-        //
-        // This is more efficient than tracking `fin` using the range buffers
-        // themselves, and lets us avoid queueing empty buffers just so we can
-        // propagate the final size.
-        let fin = self.fin_off == Some(next_off);
-
-        Some((out_buf, fin))
     }
 
     /// Updates the max_data limit to the given value.
@@ -1491,18 +1482,6 @@ impl RangeBuf {
         }
     }
 
-    /// Creates a new `RangeBuf` from the given Vec.
-    pub fn from_vec(buf: Vec<u8>, off: u64, fin: bool) -> RangeBuf {
-        RangeBuf {
-            len: buf.len(),
-            data: Arc::new(buf),
-            start: 0,
-            pos: 0,
-            off,
-            fin,
-        }
-    }
-
     /// Returns whether `self` holds the final offset in the stream.
     pub fn fin(&self) -> bool {
         self.fin
@@ -1535,15 +1514,15 @@ impl RangeBuf {
 
     /// Splits the buffer into two at the given index.
     pub fn split_off(&mut self, at: usize) -> RangeBuf {
-        if at > self.len {
-            panic!(
-                "`at` split index (is {}) should be <= len (is {})",
-                at, self.len
-            );
-        }
+        assert!(
+            at <= self.len,
+            "`at` split index (is {}) should be <= len (is {})",
+            at,
+            self.len
+        );
 
         let buf = RangeBuf {
-            data: Arc::clone(&self.data),
+            data: self.data.clone(),
             start: self.start + at,
             pos: cmp::max(self.pos, self.start + at),
             len: self.len - at,
@@ -1556,28 +1535,6 @@ impl RangeBuf {
         self.fin = false;
 
         buf
-    }
-
-    /// Clones the given number of bytes in the buffer.
-    ///
-    /// Note that no data is actually cloned, instead the underlying buffer's
-    /// reference count is increased.
-    pub fn clone_count(&self, count: usize) -> RangeBuf {
-        if count > self.len {
-            panic!(
-                "`count` clone index (is {}) should be <= len (is {})",
-                count, self.len
-            );
-        }
-
-        RangeBuf {
-            data: Arc::clone(&self.data),
-            start: self.start,
-            pos: self.pos,
-            len: cmp::min(self.len, (self.pos - self.start) + count),
-            off: self.off,
-            fin: self.fin && self.len <= (self.pos - self.start) + count,
-        }
     }
 }
 
@@ -1614,7 +1571,7 @@ mod tests {
 
     #[test]
     fn empty_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1624,7 +1581,7 @@ mod tests {
 
     #[test]
     fn empty_stream_frame() {
-        let mut recv = RecvBuf::new(15);
+        let mut recv = RecvBuf::new(15, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let buf = RangeBuf::from(b"hello", 0, false);
@@ -1680,7 +1637,7 @@ mod tests {
 
     #[test]
     fn ordered_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1717,7 +1674,7 @@ mod tests {
 
     #[test]
     fn split_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1757,7 +1714,7 @@ mod tests {
 
     #[test]
     fn incomplete_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1785,7 +1742,7 @@ mod tests {
 
     #[test]
     fn zero_len_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1813,7 +1770,7 @@ mod tests {
 
     #[test]
     fn past_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1852,7 +1809,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1883,7 +1840,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read2() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1914,7 +1871,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read3() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1945,7 +1902,7 @@ mod tests {
 
     #[test]
     fn fully_overlapping_read_multi() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -1982,7 +1939,7 @@ mod tests {
 
     #[test]
     fn overlapping_start_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -2012,7 +1969,7 @@ mod tests {
 
     #[test]
     fn overlapping_end_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -2042,7 +1999,7 @@ mod tests {
 
     #[test]
     fn partially_multi_overlapping_reordered_read() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -2079,7 +2036,7 @@ mod tests {
 
     #[test]
     fn partially_multi_overlapping_reordered_read2() {
-        let mut recv = RecvBuf::new(std::u64::MAX);
+        let mut recv = RecvBuf::new(std::u64::MAX, DEFAULT_STREAM_WINDOW);
         assert_eq!(recv.len, 0);
 
         let mut buf = [0; 32];
@@ -2369,7 +2326,7 @@ mod tests {
 
     #[test]
     fn recv_flow_control() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let mut buf = [0; 32];
@@ -2390,7 +2347,7 @@ mod tests {
 
         assert!(stream.recv.almost_full());
 
-        stream.recv.update_max_data();
+        stream.recv.update_max_data(time::Instant::now());
         assert_eq!(stream.recv.max_data_next(), 25);
         assert!(!stream.recv.almost_full());
 
@@ -2400,7 +2357,7 @@ mod tests {
 
     #[test]
     fn recv_past_fin() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2412,7 +2369,7 @@ mod tests {
 
     #[test]
     fn recv_fin_dup() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2430,7 +2387,7 @@ mod tests {
 
     #[test]
     fn recv_fin_change() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2442,7 +2399,7 @@ mod tests {
 
     #[test]
     fn recv_fin_lower_than_received() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2454,7 +2411,7 @@ mod tests {
 
     #[test]
     fn recv_fin_flow_control() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let mut buf = [0; 32];
@@ -2474,7 +2431,7 @@ mod tests {
 
     #[test]
     fn recv_fin_reset_mismatch() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, true);
@@ -2485,7 +2442,7 @@ mod tests {
 
     #[test]
     fn recv_reset_dup() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, false);
@@ -2497,7 +2454,7 @@ mod tests {
 
     #[test]
     fn recv_reset_change() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, false);
@@ -2509,7 +2466,7 @@ mod tests {
 
     #[test]
     fn recv_reset_lower_than_received() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
         assert!(!stream.recv.almost_full());
 
         let first = RangeBuf::from(b"hello", 0, false);
@@ -2522,7 +2479,7 @@ mod tests {
     fn send_flow_control() {
         let mut buf = [0; 25];
 
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         let first = b"hello";
         let second = b"world";
@@ -2565,7 +2522,7 @@ mod tests {
 
     #[test]
     fn send_past_fin() {
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         let first = b"hello";
         let second = b"world";
@@ -2581,7 +2538,7 @@ mod tests {
 
     #[test]
     fn send_fin_dup() {
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", true), Ok(5));
         assert!(stream.send.is_fin());
@@ -2592,7 +2549,7 @@ mod tests {
 
     #[test]
     fn send_undo_fin() {
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", true), Ok(5));
         assert!(stream.send.is_fin());
@@ -2607,7 +2564,7 @@ mod tests {
     fn send_fin_max_data_match() {
         let mut buf = [0; 15];
 
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         let slice = b"hellohellohello";
 
@@ -2623,7 +2580,7 @@ mod tests {
     fn send_fin_zero_length() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"", true), Ok(0));
@@ -2639,7 +2596,7 @@ mod tests {
     fn send_ack() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2669,7 +2626,7 @@ mod tests {
     fn send_ack_reordering() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2706,7 +2663,7 @@ mod tests {
 
     #[test]
     fn recv_data_below_off() {
-        let mut stream = Stream::new(15, 0, true, true);
+        let mut stream = Stream::new(15, 0, true, true, DEFAULT_STREAM_WINDOW);
 
         let first = RangeBuf::from(b"hello", 0, false);
 
@@ -2728,7 +2685,7 @@ mod tests {
 
     #[test]
     fn stream_complete() {
-        let mut stream = Stream::new(30, 30, true, true);
+        let mut stream = Stream::new(30, 30, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2771,7 +2728,7 @@ mod tests {
     fn send_fin_zero_length_output() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 15, true, true);
+        let mut stream = Stream::new(0, 15, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.off_front(), 0);
@@ -2796,7 +2753,7 @@ mod tests {
     fn send_emit() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 20, true, true);
+        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2848,7 +2805,7 @@ mod tests {
     fn send_emit_ack() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 20, true, true);
+        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -2915,7 +2872,7 @@ mod tests {
     fn send_emit_retransmit() {
         let mut buf = [0; 5];
 
-        let mut stream = Stream::new(0, 20, true, true);
+        let mut stream = Stream::new(0, 20, true, true, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -3136,66 +3093,5 @@ mod tests {
         assert_eq!(new_new_buf.fin(), true);
 
         assert_eq!(&new_new_buf[..], b"");
-    }
-
-    #[test]
-    fn rangebuf_clone_count() {
-        let mut buf = RangeBuf::from(b"helloworld", 5, true);
-        assert_eq!(buf.start, 0);
-        assert_eq!(buf.pos, 0);
-        assert_eq!(buf.len, 10);
-        assert_eq!(buf.off, 5);
-        assert_eq!(buf.fin, true);
-
-        assert_eq!(buf.len(), 10);
-        assert_eq!(buf.off(), 5);
-        assert_eq!(buf.fin(), true);
-
-        assert_eq!(&buf[..], b"helloworld");
-
-        // Clone from start.
-        let new_buf = buf.clone_count(5);
-        assert_eq!(new_buf.start, 0);
-        assert_eq!(new_buf.pos, 0);
-        assert_eq!(new_buf.len, 5);
-        assert_eq!(new_buf.off, 5);
-        assert_eq!(new_buf.fin, false);
-
-        assert_eq!(new_buf.len(), 5);
-        assert_eq!(new_buf.off(), 5);
-        assert_eq!(new_buf.fin(), false);
-
-        assert_eq!(&new_buf[..], b"hello");
-
-        // Advance buffer.
-        buf.consume(3);
-
-        // Clone again.
-        let new_buf = buf.clone_count(5);
-        assert_eq!(new_buf.start, 0);
-        assert_eq!(new_buf.pos, 3);
-        assert_eq!(new_buf.len, 8);
-        assert_eq!(new_buf.off, 5);
-        assert_eq!(new_buf.fin, false);
-
-        assert_eq!(new_buf.len(), 5);
-        assert_eq!(new_buf.off(), 8);
-        assert_eq!(new_buf.fin(), false);
-
-        assert_eq!(&new_buf[..], b"lowor");
-
-        // Clone past the end.
-        let new_buf = buf.clone_count(10);
-        assert_eq!(new_buf.start, 0);
-        assert_eq!(new_buf.pos, 3);
-        assert_eq!(new_buf.len, 10);
-        assert_eq!(new_buf.off, 5);
-        assert_eq!(new_buf.fin, true);
-
-        assert_eq!(new_buf.len(), 7);
-        assert_eq!(new_buf.off(), 8);
-        assert_eq!(new_buf.fin(), true);
-
-        assert_eq!(&new_buf[..], b"loworld");
     }
 }

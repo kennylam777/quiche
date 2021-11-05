@@ -32,10 +32,24 @@ use crate::packet;
 use crate::ranges;
 use crate::stream;
 
+#[cfg(feature = "qlog")]
+use qlog::events::quic::ErrorSpace;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::QuicFrame;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::StreamType;
+
 pub const MAX_CRYPTO_OVERHEAD: usize = 8;
 pub const MAX_DGRAM_OVERHEAD: usize = 2;
 pub const MAX_STREAM_OVERHEAD: usize = 12;
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EcnCounts {
+    ect0_count: u64,
+    ect1_count: u64,
+    ecn_ce_count: u64,
+}
 
 #[derive(Clone, PartialEq)]
 pub enum Frame {
@@ -48,6 +62,7 @@ pub enum Frame {
     ACK {
         ack_delay: u64,
         ranges: ranges::RangeSet,
+        ecn_counts: Option<EcnCounts>,
     },
 
     ResetStream {
@@ -184,7 +199,7 @@ impl Frame {
 
             0x01 => Frame::Ping,
 
-            0x02 => parse_ack_frame(frame_type, b)?,
+            0x02..=0x03 => parse_ack_frame(frame_type, b)?,
 
             0x04 => Frame::ResetStream {
                 stream_id: b.get_varint()?,
@@ -335,8 +350,16 @@ impl Frame {
                 b.put_varint(0x01)?;
             },
 
-            Frame::ACK { ack_delay, ranges } => {
-                b.put_varint(0x02)?;
+            Frame::ACK {
+                ack_delay,
+                ranges,
+                ecn_counts,
+            } => {
+                if ecn_counts.is_none() {
+                    b.put_varint(0x02)?;
+                } else {
+                    b.put_varint(0x03)?;
+                }
 
                 let mut it = ranges.iter().rev();
 
@@ -358,6 +381,12 @@ impl Frame {
                     b.put_varint(ack_block)?;
 
                     smallest_ack = block.start;
+                }
+
+                if let Some(ecn) = ecn_counts {
+                    b.put_varint(ecn.ect0_count)?;
+                    b.put_varint(ecn.ect1_count)?;
+                    b.put_varint(ecn.ecn_ce_count)?;
                 }
             },
 
@@ -538,7 +567,11 @@ impl Frame {
 
             Frame::Ping => 1,
 
-            Frame::ACK { ack_delay, ranges } => {
+            Frame::ACK {
+                ack_delay,
+                ranges,
+                ecn_counts,
+            } => {
                 let mut it = ranges.iter().rev();
 
                 let first = it.next().unwrap();
@@ -560,6 +593,12 @@ impl Frame {
                            octets::varint_len(ack_block); // ack_block
 
                     smallest_ack = block.start;
+                }
+
+                if let Some(ecn) = ecn_counts {
+                    len += octets::varint_len(ecn.ect0_count) +
+                        octets::varint_len(ecn.ect1_count) +
+                        octets::varint_len(ecn.ecn_ce_count);
                 }
 
                 len
@@ -747,21 +786,36 @@ impl Frame {
     }
 
     #[cfg(feature = "qlog")]
-    pub fn to_qlog(&self) -> qlog::QuicFrame {
+    pub fn to_qlog(&self) -> QuicFrame {
         match self {
-            Frame::Padding { .. } => qlog::QuicFrame::Padding,
+            Frame::Padding { .. } => QuicFrame::Padding,
 
-            Frame::Ping { .. } => qlog::QuicFrame::Ping,
+            Frame::Ping { .. } => QuicFrame::Ping,
 
-            Frame::ACK { ack_delay, ranges } => {
+            Frame::ACK {
+                ack_delay,
+                ranges,
+                ecn_counts,
+            } => {
                 let ack_ranges =
                     ranges.iter().map(|r| (r.start, r.end - 1)).collect();
-                qlog::QuicFrame::Ack {
+
+                let (ect0, ect1, ce) = match ecn_counts {
+                    Some(ecn) => (
+                        Some(ecn.ect0_count),
+                        Some(ecn.ect1_count),
+                        Some(ecn.ecn_ce_count),
+                    ),
+
+                    None => (None, None, None),
+                };
+
+                QuicFrame::Ack {
                     ack_delay: Some(*ack_delay as f32 / 1000.0),
                     acked_ranges: Some(ack_ranges),
-                    ect1: None,
-                    ect0: None,
-                    ce: None,
+                    ect1,
+                    ect0,
+                    ce,
                 }
             },
 
@@ -769,7 +823,7 @@ impl Frame {
                 stream_id,
                 error_code,
                 final_size,
-            } => qlog::QuicFrame::ResetStream {
+            } => QuicFrame::ResetStream {
                 stream_id: *stream_id,
                 error_code: *error_code,
                 final_size: *final_size,
@@ -778,27 +832,27 @@ impl Frame {
             Frame::StopSending {
                 stream_id,
                 error_code,
-            } => qlog::QuicFrame::StopSending {
+            } => QuicFrame::StopSending {
                 stream_id: *stream_id,
                 error_code: *error_code,
             },
 
-            Frame::Crypto { data } => qlog::QuicFrame::Crypto {
+            Frame::Crypto { data } => QuicFrame::Crypto {
                 offset: data.off(),
                 length: data.len() as u64,
             },
 
-            Frame::CryptoHeader { offset, length } => qlog::QuicFrame::Crypto {
+            Frame::CryptoHeader { offset, length } => QuicFrame::Crypto {
                 offset: *offset,
                 length: *length as u64,
             },
 
-            Frame::NewToken { token } => qlog::QuicFrame::NewToken {
+            Frame::NewToken { token } => QuicFrame::NewToken {
                 length: token.len().to_string(),
                 token: "TODO: update to qlog-02 token format".to_string(),
             },
 
-            Frame::Stream { stream_id, data } => qlog::QuicFrame::Stream {
+            Frame::Stream { stream_id, data } => QuicFrame::Stream {
                 stream_id: *stream_id,
                 offset: data.off() as u64,
                 length: data.len() as u64,
@@ -811,7 +865,7 @@ impl Frame {
                 offset,
                 length,
                 fin,
-            } => qlog::QuicFrame::Stream {
+            } => QuicFrame::Stream {
                 stream_id: *stream_id,
                 offset: *offset,
                 length: *length as u64,
@@ -819,51 +873,48 @@ impl Frame {
                 raw: None,
             },
 
-            Frame::MaxData { max } => qlog::QuicFrame::MaxData { maximum: *max },
+            Frame::MaxData { max } => QuicFrame::MaxData { maximum: *max },
 
-            Frame::MaxStreamData { stream_id, max } =>
-                qlog::QuicFrame::MaxStreamData {
-                    stream_id: *stream_id,
-                    maximum: *max,
-                },
-
-            Frame::MaxStreamsBidi { max } => qlog::QuicFrame::MaxStreams {
-                stream_type: qlog::StreamType::Bidirectional,
+            Frame::MaxStreamData { stream_id, max } => QuicFrame::MaxStreamData {
+                stream_id: *stream_id,
                 maximum: *max,
             },
 
-            Frame::MaxStreamsUni { max } => qlog::QuicFrame::MaxStreams {
-                stream_type: qlog::StreamType::Unidirectional,
+            Frame::MaxStreamsBidi { max } => QuicFrame::MaxStreams {
+                stream_type: StreamType::Bidirectional,
+                maximum: *max,
+            },
+
+            Frame::MaxStreamsUni { max } => QuicFrame::MaxStreams {
+                stream_type: StreamType::Unidirectional,
                 maximum: *max,
             },
 
             Frame::DataBlocked { limit } =>
-                qlog::QuicFrame::DataBlocked { limit: *limit },
+                QuicFrame::DataBlocked { limit: *limit },
 
             Frame::StreamDataBlocked { stream_id, limit } =>
-                qlog::QuicFrame::StreamDataBlocked {
+                QuicFrame::StreamDataBlocked {
                     stream_id: *stream_id,
                     limit: *limit,
                 },
 
-            Frame::StreamsBlockedBidi { limit } =>
-                qlog::QuicFrame::StreamsBlocked {
-                    stream_type: qlog::StreamType::Bidirectional,
-                    limit: *limit,
-                },
+            Frame::StreamsBlockedBidi { limit } => QuicFrame::StreamsBlocked {
+                stream_type: StreamType::Bidirectional,
+                limit: *limit,
+            },
 
-            Frame::StreamsBlockedUni { limit } =>
-                qlog::QuicFrame::StreamsBlocked {
-                    stream_type: qlog::StreamType::Unidirectional,
-                    limit: *limit,
-                },
+            Frame::StreamsBlockedUni { limit } => QuicFrame::StreamsBlocked {
+                stream_type: StreamType::Unidirectional,
+                limit: *limit,
+            },
 
             Frame::NewConnectionId {
                 seq_num,
                 retire_prior_to,
                 conn_id,
                 ..
-            } => qlog::QuicFrame::NewConnectionId {
+            } => QuicFrame::NewConnectionId {
                 sequence_number: *seq_num as u32,
                 retire_prior_to: *retire_prior_to as u32,
                 length: conn_id.len() as u64,
@@ -872,20 +923,19 @@ impl Frame {
             },
 
             Frame::RetireConnectionId { seq_num } =>
-                qlog::QuicFrame::RetireConnectionId {
+                QuicFrame::RetireConnectionId {
                     sequence_number: *seq_num as u32,
                 },
 
             Frame::PathChallenge { .. } =>
-                qlog::QuicFrame::PathChallenge { data: None },
+                QuicFrame::PathChallenge { data: None },
 
-            Frame::PathResponse { .. } =>
-                qlog::QuicFrame::PathResponse { data: None },
+            Frame::PathResponse { .. } => QuicFrame::PathResponse { data: None },
 
             Frame::ConnectionClose {
                 error_code, reason, ..
-            } => qlog::QuicFrame::ConnectionClose {
-                error_space: qlog::ErrorSpace::TransportError,
+            } => QuicFrame::ConnectionClose {
+                error_space: ErrorSpace::TransportError,
                 error_code: *error_code,
                 raw_error_code: None, // raw error is no different for us
                 reason: Some(String::from_utf8(reason.clone()).unwrap()),
@@ -893,22 +943,22 @@ impl Frame {
             },
 
             Frame::ApplicationClose { error_code, reason } =>
-                qlog::QuicFrame::ConnectionClose {
-                    error_space: qlog::ErrorSpace::ApplicationError,
+                QuicFrame::ConnectionClose {
+                    error_space: ErrorSpace::ApplicationError,
                     error_code: *error_code,
                     raw_error_code: None, // raw error is no different for us
                     reason: Some(String::from_utf8(reason.clone()).unwrap()),
                     trigger_frame_type: None, // don't know trigger type
                 },
 
-            Frame::HandshakeDone => qlog::QuicFrame::HandshakeDone,
+            Frame::HandshakeDone => QuicFrame::HandshakeDone,
 
-            Frame::Datagram { data } => qlog::QuicFrame::Datagram {
+            Frame::Datagram { data } => QuicFrame::Datagram {
                 length: data.len() as u64,
                 raw: None,
             },
 
-            Frame::DatagramHeader { length } => qlog::QuicFrame::Datagram {
+            Frame::DatagramHeader { length } => QuicFrame::Datagram {
                 length: *length as u64,
                 raw: None,
             },
@@ -927,8 +977,16 @@ impl std::fmt::Debug for Frame {
                 write!(f, "PING")?;
             },
 
-            Frame::ACK { ack_delay, ranges } => {
-                write!(f, "ACK delay={} blocks={:?}", ack_delay, ranges)?;
+            Frame::ACK {
+                ack_delay,
+                ranges,
+                ecn_counts,
+            } => {
+                write!(
+                    f,
+                    "ACK delay={} blocks={:?} ecn_counts={:?}",
+                    ack_delay, ranges, ecn_counts
+                )?;
             },
 
             Frame::ResetStream {
@@ -1079,7 +1137,9 @@ impl std::fmt::Debug for Frame {
     }
 }
 
-fn parse_ack_frame(_ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+    let first = ty as u8;
+
     let largest_ack = b.get_varint()?;
     let ack_delay = b.get_varint()?;
     let block_count = b.get_varint()?;
@@ -1116,7 +1176,23 @@ fn parse_ack_frame(_ty: u64, b: &mut octets::Octets) -> Result<Frame> {
         ranges.insert(smallest_ack..largest_ack + 1);
     }
 
-    Ok(Frame::ACK { ack_delay, ranges })
+    let ecn_counts = if first & 0x01 != 0 {
+        let ecn = EcnCounts {
+            ect0_count: b.get_varint()?,
+            ect1_count: b.get_varint()?,
+            ecn_ce_count: b.get_varint()?,
+        };
+
+        Some(ecn)
+    } else {
+        None
+    };
+
+    Ok(Frame::ACK {
+        ack_delay,
+        ranges,
+        ecn_counts,
+    })
 }
 
 pub fn encode_crypto_header(
@@ -1288,6 +1364,7 @@ mod tests {
         let frame = Frame::ACK {
             ack_delay: 874_656_534,
             ranges,
+            ecn_counts: None,
         };
 
         let wire_len = {
@@ -1296,6 +1373,48 @@ mod tests {
         };
 
         assert_eq!(wire_len, 17);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_ok());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_ok());
+    }
+
+    #[test]
+    fn ack_ecn() {
+        let mut d = [42; 128];
+
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(4..7);
+        ranges.insert(9..12);
+        ranges.insert(15..19);
+        ranges.insert(3000..5000);
+
+        let ecn_counts = Some(EcnCounts {
+            ect0_count: 100,
+            ect1_count: 200,
+            ecn_ce_count: 300,
+        });
+
+        let frame = Frame::ACK {
+            ack_delay: 874_656_534,
+            ranges,
+            ecn_counts,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 23);
 
         let mut b = octets::Octets::with_slice(&d);
         assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
