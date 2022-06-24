@@ -105,7 +105,7 @@ List of configuration directives
 
 **context:** *http*, *server*
 
-Sets the congestion control method. Allowed values are: reno(default), cubic
+Sets the congestion control method. Allowed values are: reno(default), cubic, bbr, bbr2
 
 ### http3_max_concurrent_streams
 

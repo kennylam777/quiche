@@ -29,7 +29,7 @@ Subject: [PATCH] Initial QUIC and HTTP/3 implementation using quiche
  src/http/v3/ngx_http_v3.c               | 2231 +++++++++++++++++++++++
  src/http/v3/ngx_http_v3.h               |   79 +
  src/http/v3/ngx_http_v3_filter_module.c |   68 +
- src/http/v3/ngx_http_v3_module.c        |  306 +++
+ src/http/v3/ngx_http_v3_module.c        |  308 +++
  src/http/v3/ngx_http_v3_module.h        |   34 +
  src/os/unix/ngx_udp_sendmsg_chain.c     |    1 +
  28 files changed, 3746 insertions(+), 11 deletions(-)
@@ -4012,7 +4012,7 @@ new file mode 100644
 index 000000000..30955c4cd
 --- /dev/null
 +++ b/src/http/v3/ngx_http_v3_module.c
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,308 @@
 +
 +/*
 + * Copyright (C) Cloudflare, Inc.
@@ -4042,6 +4042,8 @@ index 000000000..30955c4cd
 +static ngx_conf_enum_t  ngx_quiche_cc_algorithm[] = {
 +	{ ngx_string("reno"), QUICHE_CC_RENO },
 +	{ ngx_string("cubic"), QUICHE_CC_CUBIC },
++	{ ngx_string("bbr"), QUICHE_CC_BBR },
++	{ ngx_string("bbr2"), QUICHE_CC_BBR2 },
 +	{ ngx_null_string, 0 }
 +};
 +
