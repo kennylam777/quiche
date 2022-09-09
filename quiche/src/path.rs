@@ -71,7 +71,7 @@ impl PathState {
 }
 
 /// A path-specific event.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathEvent {
     /// A new network path (local address, peer address) has been seen on a
     /// received packet. Note that this event is only triggered for servers, as
@@ -93,7 +93,7 @@ pub enum PathEvent {
     Closed(SocketAddr, SocketAddr),
 
     /// The stack observes that the Source Connection ID with the given sequence
-    /// number, initialy used by the peer over the first pair of `SocketAddr`s,
+    /// number, initially used by the peer over the first pair of `SocketAddr`s,
     /// is now reused over the second pair of `SocketAddr`s.
     ReusedSourceConnectionId(
         u64,
@@ -399,7 +399,7 @@ impl Path {
         if let Some(lost_probe_time) = lost_probe_time {
             self.last_probe_lost_time = match self.last_probe_lost_time {
                 Some(last) => {
-                    // Count a loss if at least 1-RTT happenned.
+                    // Count a loss if at least 1-RTT happened.
                     if lost_probe_time - last >= self.recovery.rtt() {
                         self.probing_lost += 1;
                         Some(lost_probe_time)
@@ -477,6 +477,9 @@ pub struct PathMap {
     /// that is used by `addrs_to_paths` and `ConnectionEntry`.
     paths: Slab<Path>,
 
+    /// The maximum number of concurrent paths allowed.
+    max_concurrent_paths: usize,
+
     /// The mapping from the (local `SocketAddr`, peer `SocketAddr`) to the
     /// `Path` structure identifier.
     addrs_to_paths: BTreeMap<(SocketAddr, SocketAddr), usize>,
@@ -494,7 +497,7 @@ impl PathMap {
     pub fn new(
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
     ) -> Self {
-        let mut paths = Slab::with_capacity(max_concurrent_paths);
+        let mut paths = Slab::with_capacity(1); // most connections only have one path
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -508,6 +511,7 @@ impl PathMap {
 
         Self {
             paths,
+            max_concurrent_paths,
             addrs_to_paths,
             events: VecDeque::new(),
             is_server,
@@ -608,7 +612,7 @@ impl PathMap {
     ///
     /// [`Done`]: enum.Error.html#variant.Done
     fn make_room_for_new_path(&mut self) -> Result<()> {
-        if self.paths.len() < self.paths.capacity() {
+        if self.paths.len() < self.max_concurrent_paths {
             return Ok(());
         }
 
@@ -737,7 +741,7 @@ impl PathMap {
     /// Sets the path with identifier 'path_id' to be active.
     ///
     /// There can be exactly one active path on which non-probing packets can be
-    /// sent. If another path is marked as active, it will be superseeded by the
+    /// sent. If another path is marked as active, it will be superseded by the
     /// one having `path_id` as identifier.
     ///
     /// A server should always ensure that the active path is validated. If it

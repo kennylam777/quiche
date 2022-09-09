@@ -456,7 +456,7 @@ const MAX_PROBING_TIMEOUTS: usize = 3;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A QUIC error.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// There is no more work to do.
     Done,
@@ -582,7 +582,7 @@ impl std::convert::From<octets::BufferTooShortError> for Error {
 }
 
 /// Ancillary information about incoming packets.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecvInfo {
     /// The remote address the packet was received from.
     pub from: SocketAddr,
@@ -592,7 +592,7 @@ pub struct RecvInfo {
 }
 
 /// Ancillary information about outgoing packets.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendInfo {
     /// The local address the packet should be sent from.
     pub from: SocketAddr,
@@ -609,7 +609,7 @@ pub struct SendInfo {
 }
 
 /// Represents information carried by `CONNECTION_CLOSE` frames.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionError {
     /// Whether the error came from the application or the transport layer.
     pub is_app: bool,
@@ -2734,12 +2734,16 @@ impl Connection {
     ///  * When the application receives data from the peer (for example any
     ///    time [`stream_recv()`] is called).
     ///
+    /// Once [`is_draining()`] returns `true`, it is no longer necessary to call
+    /// `send()` and all calls will return [`Done`].
+    ///
     /// [`Done`]: enum.Error.html#variant.Done
     /// [`recv()`]: struct.Connection.html#method.recv
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
     /// [`stream_send()`]: struct.Connection.html#method.stream_send
     /// [`stream_shutdown()`]: struct.Connection.html#method.stream_shutdown
     /// [`stream_recv()`]: struct.Connection.html#method.stream_recv
+    /// [`is_draining()`]: struct.Connection.html#method.is_draining
     ///
     /// ## Examples:
     ///
@@ -2799,8 +2803,8 @@ impl Connection {
     ///
     /// The application should call `send_on_path()` multiple times until
     /// [`Done`] is returned, indicating that there are no more packets to
-    /// send. It is recommended that `send()` be called in the following
-    /// cases:
+    /// send. It is recommended that `send_on_path()` be called in the
+    /// following cases:
     ///
     ///  * When the application receives QUIC packets from the peer (that is,
     ///    any time [`recv()`] is also called).
@@ -2814,6 +2818,9 @@ impl Connection {
     ///  * When the application receives data from the peer (for example any
     ///    time [`stream_recv()`] is called).
     ///
+    /// Once [`is_draining()`] returns `true`, it is no longer necessary to call
+    /// `send_on_path()` and all calls will return [`Done`].
+    ///
     /// [`Done`]: enum.Error.html#variant.Done
     /// [`InvalidState`]: enum.Error.html#InvalidState
     /// [`recv()`]: struct.Connection.html#method.recv
@@ -2823,6 +2830,7 @@ impl Connection {
     /// [`stream_recv()`]: struct.Connection.html#method.stream_recv
     /// [`path_event_next()`]: struct.Connection.html#method.path_event_next
     /// [`paths_iter()`]: struct.Connection.html#method.paths_iter
+    /// [`is_draining()`]: struct.Connection.html#method.is_draining
     ///
     /// ## Examples:
     ///
@@ -3237,6 +3245,11 @@ impl Connection {
         let mut in_flight = false;
         let mut has_data = false;
 
+        // Whether or not we should explicitly elicit an ACK via PING frame if we
+        // implicitly elicit one otherwise.
+        let ack_elicit_required =
+            self.paths.get(send_pid)?.recovery.should_elicit_ack(epoch);
+
         let header_offset = b.off();
 
         // Reserve space for payload length in advance. Since we don't yet know
@@ -3288,9 +3301,13 @@ impl Connection {
         }
 
         // Create ACK frame.
+        //
+        // If we think we may explicitly elicit an ACK via PING later, go ahead
+        // and generate an ACK (if there's anything to ACK) since we're going to
+        // send a packet with PING anyways - even if we haven't received
+        // anything ACK eliciting.
         if self.pkt_num_spaces[epoch].recv_pkt_need_ack.len() > 0 &&
-            (self.pkt_num_spaces[epoch].ack_elicited ||
-                self.paths.get(send_pid)?.recovery.loss_probes[epoch] > 0) &&
+            (self.pkt_num_spaces[epoch].ack_elicited || ack_elicit_required) &&
             !is_closing &&
             self.paths.get(send_pid)?.active()
         {
@@ -3849,12 +3866,10 @@ impl Connection {
         // Alternate trying to send DATAGRAMs next time.
         self.emit_dgram = !dgram_emitted;
 
-        // Create PING for PTO probe if no other ack-eliciting frame is sent.
-        if self.paths.get(send_pid)?.recovery.loss_probes[epoch] > 0 &&
-            !ack_eliciting &&
-            left >= 1 &&
-            !is_closing
-        {
+        // Create PING for PTO probe if no other ack-eliciting frame is sent or if
+        // we've sent too many non ACK eliciting packets without having
+        // sent an ACK eliciting one
+        if ack_elicit_required && !ack_eliciting && left >= 1 && !is_closing {
             let frame = frame::Frame::Ping;
 
             if push_frame_to_pkt!(b, frames, frame, left) {
@@ -4081,11 +4096,11 @@ impl Connection {
     /// This represents the maximum size of a packet burst as determined by the
     /// congestion control algorithm in use.
     ///
-    /// Applications can, for example, use it in conjuction with segmentatation
+    /// Applications can, for example, use it in conjunction with segmentation
     /// offloading mechanisms as the maximum limit for outgoing aggregates of
     /// multiple packets.
     #[inline]
-    pub fn send_quantum(&mut self) -> usize {
+    pub fn send_quantum(&self) -> usize {
         match self.paths.get_active() {
             Ok(p) => p.recovery.send_quantum(),
             _ => 0,
@@ -4097,14 +4112,14 @@ impl Connection {
     /// This represents the maximum size of a packet burst as determined by the
     /// congestion control algorithm in use.
     ///
-    /// Applications can, for example, use it in conjuction with segmentatation
+    /// Applications can, for example, use it in conjunction with segmentation
     /// offloading mechanisms as the maximum limit for outgoing aggregates of
     /// multiple packets.
     ///
     /// If the (`local_addr`, peer_addr`) 4-tuple relates to a non-existing
     /// path, this method returns 0.
     pub fn send_quantum_on_path(
-        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
+        &self, local_addr: SocketAddr, peer_addr: SocketAddr,
     ) -> usize {
         self.paths
             .path_id_from_addrs(&(local_addr, peer_addr))
@@ -5279,7 +5294,7 @@ impl Connection {
     /// the maximum number of active Connection IDs it negotiated. In such case
     /// (i.e., when [`source_cids_left()`] returns 0), if the host agrees to
     /// request the removal of previous connection IDs, it sets the
-    /// `retire_if_needed` parameter. Otherwhise, an [`IdLimit`] is returned.
+    /// `retire_if_needed` parameter. Otherwise, an [`IdLimit`] is returned.
     ///
     /// Note that setting `retire_if_needed` does not prevent this function from
     /// returning an [`IdLimit`] in the case the caller wants to retire still
@@ -5325,6 +5340,11 @@ impl Connection {
 
     /// Returns the number of source Connection IDs that can still be provided
     /// to the peer without exceeding the limit it advertised.
+    ///
+    /// The application should not issue the maximum number of permitted source
+    /// Connection IDs, but instead treat this as an untrusted upper bound.
+    /// Applications should limit how many outstanding source ConnectionIDs
+    /// are simultaneously issued to prevent issuing more than they can handle.
     #[inline]
     pub fn source_cids_left(&self) -> usize {
         self.max_active_source_cids() - self.active_source_cids()
@@ -5553,6 +5573,17 @@ impl Connection {
         self.handshake.peer_cert()
     }
 
+    /// Returns the peer's certificate chain (if any) as a vector of DER-encoded
+    /// buffers.
+    ///
+    /// The certificate at index 0 is the peer's leaf certificate, the other
+    /// certificates (if any) are the chain certificate authorities used to
+    /// sign the leaf certificate.
+    #[inline]
+    pub fn peer_cert_chain(&self) -> Option<Vec<&[u8]>> {
+        self.handshake.peer_cert_chain()
+    }
+
     /// Returns the serialized cryptographic session for the connection.
     ///
     /// This can be used by a client to cache a connection's session, and resume
@@ -5645,11 +5676,13 @@ impl Connection {
 
     /// Returns true if the connection is draining.
     ///
-    /// If this returns true, the connection object cannot yet be dropped, but
+    /// If this returns `true`, the connection object cannot yet be dropped, but
     /// no new application data can be sent or received. An application should
-    /// continue calling the [`recv()`], [`send()`], [`timeout()`], and
-    /// [`on_timeout()`] methods as normal, until the [`is_closed()`] method
-    /// returns `true`.
+    /// continue calling the [`recv()`], [`timeout()`], and [`on_timeout()`]
+    /// methods as normal, until the [`is_closed()`] method returns `true`.
+    ///
+    /// In contrast, once `is_draining()` returns `true`, calling [`send()`]
+    /// is not required because no new outgoing packets will be generated.
     ///
     /// [`recv()`]: struct.Connection.html#method.recv
     /// [`send()`]: struct.Connection.html#method.send
@@ -5704,7 +5737,6 @@ impl Connection {
     /// Collects and returns statistics about the connection.
     #[inline]
     pub fn stats(&self) -> Stats {
-        let paths = self.paths.iter().map(|(_, p)| p.stats()).collect();
         Stats {
             recv: self.recv_count,
             sent: self.sent_count,
@@ -5714,6 +5746,7 @@ impl Connection {
             recv_bytes: self.recv_bytes,
             lost_bytes: self.lost_bytes,
             stream_retrans_bytes: self.stream_retrans_bytes,
+            paths_count: self.paths.len(),
             peer_max_idle_timeout: self.peer_transport_params.max_idle_timeout,
             peer_max_udp_payload_size: self
                 .peer_transport_params
@@ -5747,8 +5780,13 @@ impl Connection {
             peer_max_datagram_frame_size: self
                 .peer_transport_params
                 .max_datagram_frame_size,
-            paths,
         }
+    }
+
+    /// Collects and returns statistics about each known path for the
+    /// connection.
+    pub fn path_stats(&self) -> impl Iterator<Item = PathStats> + '_ {
+        self.paths.iter().map(|(_, p)| p.stats())
     }
 
     fn encode_transport_params(&mut self) -> Result<()> {
@@ -6886,8 +6924,11 @@ pub struct Stats {
     /// The number of bytes sent lost.
     pub lost_bytes: u64,
 
-    /// The number of stream bytes retranmitted.
+    /// The number of stream bytes retransmitted.
     pub stream_retrans_bytes: u64,
+
+    /// The number of known paths for the connection.
+    pub paths_count: usize,
 
     /// The maximum idle timeout.
     pub peer_max_idle_timeout: u64,
@@ -6927,9 +6968,6 @@ pub struct Stats {
 
     /// DATAGRAM frame extension parameter, if any.
     pub peer_max_datagram_frame_size: Option<u64>,
-
-    /// Statistics of the current paths.
-    pub paths: Vec<path::PathStats>,
 }
 
 impl std::fmt::Debug for Stats {
@@ -7011,14 +7049,6 @@ impl std::fmt::Debug for Stats {
             self.peer_max_datagram_frame_size,
         )?;
 
-        write!(f, " }}")?;
-
-        write!(f, " paths={{ ")?;
-        for (i, p) in self.paths.iter().enumerate() {
-            write!(f, "{}: {{", i)?;
-            p.fmt(f)?;
-            write!(f, "}} ")?;
-        }
         write!(f, "}}")
     }
 }
@@ -7391,14 +7421,9 @@ impl TransportParams {
             self.original_destination_connection_id.as_ref(),
         );
 
-        let stateless_reset_token = Some(qlog::Token {
-            ty: Some(qlog::TokenType::StatelessReset),
-            length: None,
-            data: qlog::HexSlice::maybe_string(
-                self.stateless_reset_token.map(|s| s.to_be_bytes()).as_ref(),
-            ),
-            details: None,
-        });
+        let stateless_reset_token = qlog::HexSlice::maybe_string(
+            self.stateless_reset_token.map(|s| s.to_be_bytes()).as_ref(),
+        );
 
         EventData::TransportParametersSet(
             qlog::events::quic::TransportParametersSet {
@@ -7913,7 +7938,7 @@ mod tests {
             TransportParams::encode(&tp, true, &mut raw_params).unwrap();
         assert_eq!(raw_params.len(), 94);
 
-        let new_tp = TransportParams::decode(&raw_params, false).unwrap();
+        let new_tp = TransportParams::decode(raw_params, false).unwrap();
 
         assert_eq!(new_tp, tp);
 
@@ -7943,7 +7968,7 @@ mod tests {
             TransportParams::encode(&tp, false, &mut raw_params).unwrap();
         assert_eq!(raw_params.len(), 69);
 
-        let new_tp = TransportParams::decode(&raw_params, true).unwrap();
+        let new_tp = TransportParams::decode(raw_params, true).unwrap();
 
         assert_eq!(new_tp, tp);
     }
@@ -8231,7 +8256,7 @@ mod tests {
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
 
-        assert_eq!(pipe.client.set_session(&session), Ok(()));
+        assert_eq!(pipe.client.set_session(session), Ok(()));
         assert_eq!(pipe.handshake(), Ok(()));
 
         assert_eq!(pipe.client.is_established(), true);
@@ -8295,7 +8320,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&session), Ok(()));
+        assert_eq!(pipe.client.set_session(session), Ok(()));
 
         // Client sends initial flight.
         let (len, _) = pipe.client.send(&mut buf).unwrap();
@@ -8356,7 +8381,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&session), Ok(()));
+        assert_eq!(pipe.client.set_session(session), Ok(()));
 
         // Client sends initial flight.
         let (len, _) = pipe.client.send(&mut buf).unwrap();
@@ -8427,7 +8452,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&session), Ok(()));
+        assert_eq!(pipe.client.set_session(session), Ok(()));
 
         // Client sends initial flight.
         pipe.client.send(&mut buf).unwrap();
@@ -8548,7 +8573,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&session), Ok(()));
+        assert_eq!(pipe.client.set_session(session), Ok(()));
 
         // Client sends initial flight.
         let (len, _) = pipe.client.send(&mut buf).unwrap();
@@ -9508,7 +9533,7 @@ mod tests {
 
         // Emulate handshake packet delay by not making server process client
         // packet.
-        let delayed = flight.clone();
+        let delayed = flight;
 
         testing::emit_flight(&mut pipe.server).ok();
 
@@ -9674,7 +9699,7 @@ mod tests {
 
         assert_eq!(frames.len(), 1);
 
-        match frames.iter().next() {
+        match frames.first() {
             Some(frame::Frame::ACK { .. }) => (),
 
             f => panic!("expected ACK frame, got {:?}", f),
@@ -10153,7 +10178,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::Stream {
                 stream_id: 0,
                 data: stream::RangeBuf::from(b"aaaaa", 0, false),
@@ -10166,7 +10191,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::Stream {
                 stream_id: 4,
                 data: stream::RangeBuf::from(b"aaaaa", 0, false),
@@ -10870,6 +10895,29 @@ mod tests {
             Some(c) => assert_eq!(c.len(), 753),
 
             None => panic!("missing server certificate"),
+        }
+    }
+
+    #[test]
+    fn peer_cert_chain() {
+        let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert-big.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+
+        let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        match pipe.client.peer_cert_chain() {
+            Some(c) => assert_eq!(c.len(), 5),
+
+            None => panic!("missing server certificate chain"),
         }
     }
 
@@ -11646,7 +11694,7 @@ mod tests {
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
-            let stream = frames.iter().next().unwrap();
+            let stream = frames.first().unwrap();
 
             assert_eq!(stream, &frame::Frame::Stream {
                 stream_id: 8,
@@ -11669,7 +11717,7 @@ mod tests {
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
-            let stream = frames.iter().next().unwrap();
+            let stream = frames.first().unwrap();
 
             assert_eq!(stream, &frame::Frame::Stream {
                 stream_id: 16,
@@ -11692,7 +11740,7 @@ mod tests {
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
-            let stream = frames.iter().next().unwrap();
+            let stream = frames.first().unwrap();
 
             assert_eq!(stream, &frame::Frame::Stream {
                 stream_id: 20,
@@ -11717,7 +11765,7 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
 
             assert_eq!(
-                frames.iter().next(),
+                frames.first(),
                 Some(&frame::Frame::Stream {
                     stream_id: 12,
                     data: stream::RangeBuf::from(&out, off, false),
@@ -11730,7 +11778,7 @@ mod tests {
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
 
-            let stream = frames.iter().next().unwrap();
+            let stream = frames.first().unwrap();
 
             assert_eq!(stream, &frame::Frame::Stream {
                 stream_id: 4,
@@ -11753,7 +11801,7 @@ mod tests {
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
-            let stream = frames.iter().next().unwrap();
+            let stream = frames.first().unwrap();
 
             assert_eq!(stream, &frame::Frame::Stream {
                 stream_id: 0,
@@ -11839,7 +11887,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::Stream {
                 stream_id: 8,
                 data: stream::RangeBuf::from(b"b", 0, false),
@@ -11853,7 +11901,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::Stream {
                 stream_id: 0,
                 data: stream::RangeBuf::from(b"b", 0, false),
@@ -11867,7 +11915,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::Stream {
                 stream_id: 12,
                 data: stream::RangeBuf::from(b"b", 0, false),
@@ -11880,7 +11928,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::Stream {
                 stream_id: 4,
                 data: stream::RangeBuf::from(b"b", 0, false),
@@ -12741,7 +12789,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::ConnectionClose {
                 error_code: 0x1234,
                 frame_type: 0,
@@ -12767,7 +12815,7 @@ mod tests {
             testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
 
         assert_eq!(
-            frames.iter().next(),
+            frames.first(),
             Some(&frame::Frame::ApplicationClose {
                 error_code: 0x1234,
                 reason: b"hello!".to_vec(),
@@ -14451,6 +14499,49 @@ mod tests {
         assert_eq!(fin, true);
         assert_eq!(rcv_data_1 + rcv_data_2, DATA_BYTES);
     }
+
+    #[test]
+    fn consecutive_non_ack_eliciting() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client sends a bunch of PING frames, causing server to ACK (ACKs aren't
+        // ack-eliciting)
+        let frames = [frame::Frame::Ping];
+        let pkt_type = packet::Type::Short;
+        for _ in 0..24 {
+            let len = pipe
+                .send_pkt_to_server(pkt_type, &frames, &mut buf)
+                .unwrap();
+            assert!(len > 0);
+
+            let frames =
+                testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| matches!(frame, frame::Frame::ACK { .. })),
+                "ACK only"
+            );
+        }
+
+        // After 24 non-ack-eliciting, an ACK is explicitly elicited with a PING
+        let len = pipe
+            .send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
+        assert!(len > 0);
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, frame::Frame::Ping)),
+            "found a PING"
+        );
+    }
 }
 
 pub use crate::packet::ConnectionId;
@@ -14458,6 +14549,7 @@ pub use crate::packet::Header;
 pub use crate::packet::Type;
 
 pub use crate::path::PathEvent;
+pub use crate::path::PathStats;
 pub use crate::path::SocketAddrIter;
 
 pub use crate::recovery::CongestionControlAlgorithm;

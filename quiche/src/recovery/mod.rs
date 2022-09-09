@@ -70,6 +70,10 @@ const LOSS_REDUCTION_FACTOR: f64 = 0.5;
 
 const PACING_MULTIPLIER: f64 = 1.25;
 
+// How many non ACK eliciting packets we send before including a PING to solicit
+// an ACK.
+const MAX_OUTSTANDING_NON_ACK_ELICITING: usize = 24;
+
 pub struct Recovery {
     loss_detection_timer: Option<Instant>,
 
@@ -155,6 +159,12 @@ pub struct Recovery {
     // The maximum size of a data aggregate scheduled and
     // transmitted together.
     send_quantum: usize,
+
+    // BBR state.
+    bbr_state: bbr::State,
+
+    /// How many non-ack-eliciting packets have been sent.
+    outstanding_non_ack_eliciting: usize,
 }
 
 pub struct RecoveryConfig {
@@ -266,6 +276,10 @@ impl Recovery {
 
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
+
+            bbr_state: bbr::State::new(),
+
+            outstanding_non_ack_eliciting: 0,
         }
     }
 
@@ -287,6 +301,14 @@ impl Recovery {
         self.prr = prr::PRR::default();
     }
 
+    /// Returns whether or not we should elicit an ACK even if we wouldn't
+    /// otherwise have constructed an ACK eliciting packet.
+    pub fn should_elicit_ack(&self, epoch: packet::Epoch) -> bool {
+        self.loss_probes[epoch] > 0 ||
+            self.outstanding_non_ack_eliciting >=
+                MAX_OUTSTANDING_NON_ACK_ELICITING
+    }
+
     pub fn on_packet_sent(
         &mut self, mut pkt: Sent, epoch: packet::Epoch,
         handshake_status: HandshakeStatus, now: Instant, trace_id: &str,
@@ -295,6 +317,12 @@ impl Recovery {
         let in_flight = pkt.in_flight;
         let sent_bytes = pkt.size;
         let pkt_num = pkt.pkt_num;
+
+        if ack_eliciting {
+            self.outstanding_non_ack_eliciting = 0;
+        } else {
+            self.outstanding_non_ack_eliciting += 1;
+        }
 
         self.largest_sent_pkt[epoch] =
             cmp::max(self.largest_sent_pkt[epoch], pkt_num);
@@ -1005,13 +1033,15 @@ impl Recovery {
 ///
 /// This enum provides currently available list of congestion control
 /// algorithms.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(C)]
 pub enum CongestionControlAlgorithm {
     /// Reno congestion control algorithm. `reno` in a string form.
     Reno  = 0,
     /// CUBIC congestion control algorithm (default). `cubic` in a string form.
     CUBIC = 1,
+    /// BBR congestion control algorithm. `bbr` in a string form.
+    BBR   = 2,
 }
 
 impl FromStr for CongestionControlAlgorithm {
@@ -1024,6 +1054,7 @@ impl FromStr for CongestionControlAlgorithm {
         match name {
             "reno" => Ok(CongestionControlAlgorithm::Reno),
             "cubic" => Ok(CongestionControlAlgorithm::CUBIC),
+            "bbr" => Ok(CongestionControlAlgorithm::BBR),
 
             _ => Err(crate::Error::CongestionControl),
         }
@@ -1069,6 +1100,7 @@ impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
         match algo {
             CongestionControlAlgorithm::Reno => &reno::RENO,
             CongestionControlAlgorithm::CUBIC => &cubic::CUBIC,
+            CongestionControlAlgorithm::BBR => &bbr::BBR,
         }
     }
 }
@@ -1953,7 +1985,7 @@ mod tests {
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
         assert_eq!(r.bytes_in_flight, 12000);
 
-        // First packet will be sent out immidiately.
+        // First packet will be sent out immediately.
         assert_eq!(r.pacer.rate(), 0);
         assert_eq!(r.get_packet_send_time(), now);
 
@@ -2010,7 +2042,7 @@ mod tests {
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
         assert_eq!(r.bytes_in_flight, 6000);
 
-        // Pacing is not done during intial phase of connection.
+        // Pacing is not done during initial phase of connection.
         assert_eq!(r.get_packet_send_time(), now);
 
         // Send the third packet out.
@@ -2082,6 +2114,7 @@ mod tests {
     }
 }
 
+mod bbr;
 mod cubic;
 mod delivery_rate;
 mod hystart;

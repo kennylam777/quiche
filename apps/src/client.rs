@@ -65,7 +65,7 @@ pub fn connect(
 
     // Resolve server address.
     let peer_addr = if let Some(addr) = &args.connect_to {
-        addr.parse().unwrap()
+        addr.parse().expect("--connect-to is expected to be a string containing an IPv4 or IPv6 address with a port. E.g. 192.0.2.0:443")
     } else {
         connect_url.to_socket_addrs().unwrap().next().unwrap()
     };
@@ -317,7 +317,11 @@ pub fn connect(
         trace!("done reading");
 
         if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
+            info!(
+                "connection closed, {:?} {:?}",
+                conn.stats(),
+                conn.path_stats().collect::<Vec<quiche::PathStats>>()
+            );
 
             if !conn.is_established() {
                 error!(
@@ -389,6 +393,10 @@ pub fn connect(
                     &args.req_headers,
                     &args.body,
                     &args.method,
+                    args.send_priority_update,
+                    conn_args.max_field_section_size,
+                    conn_args.qpack_max_table_capacity,
+                    conn_args.qpack_blocked_streams,
                     args.dump_json,
                     dgram_sender,
                     Rc::clone(&output_sink),
@@ -453,7 +461,7 @@ pub fn connect(
                     new,
                 ) => {
                     info!(
-                        "Peer reused cid seq {} (intially {:?}) on {:?}",
+                        "Peer reused cid seq {} (initially {:?}) on {:?}",
                         cid_seq, old, new
                     );
                 },
@@ -556,7 +564,11 @@ pub fn connect(
         }
 
         if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
+            info!(
+                "connection closed, {:?} {:?}",
+                conn.stats(),
+                conn.path_stats().collect::<Vec<quiche::PathStats>>()
+            );
 
             if !conn.is_established() {
                 error!(
